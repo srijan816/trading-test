@@ -17,6 +17,7 @@ import logging
 import os
 from pathlib import Path
 import json
+import signal
 import sys
 from typing import Any
 
@@ -38,6 +39,7 @@ from arena.filters.spread_filter import SpreadFilter
 from arena.models import DailySnapshot, Decision, ExecutionResult, Market, ProposedAction, utc_now
 from arena.risk.kelly import compute_position_size
 from arena.risk.risk_manager import RiskManager
+from arena.risk.trading_guardrails import FAILURE_STATUSES, maybe_trigger_trading_pause
 from arena.strategies.algo_forecast import ForecastConsensusStrategy
 from arena.strategies.algo_harvester import LateStageHarvesterStrategy
 from arena.strategies.algo_partition import PartitionArbitrageStrategy
@@ -210,6 +212,29 @@ async def run_discovery_scout(app_config: AppConfig, db: ArenaDB) -> None:
     except Exception as exc:
         logger.exception("Discovery scout failed")
         db.record_event("discovery_scout_error", {"error": str(exc)})
+
+
+def _apply_execution_circuit_breaker(db: ArenaDB, execution: ExecutionResult) -> None:
+    if str(execution.status).lower() not in FAILURE_STATUSES:
+        return
+    pause = maybe_trigger_trading_pause(
+        db,
+        execution.strategy_id,
+        threshold=int(os.getenv("RISK_ORDER_FAILURE_PAUSE_THRESHOLD", "5")),
+        minutes=int(os.getenv("RISK_ORDER_FAILURE_PAUSE_MINUTES", "5")),
+    )
+    if pause is not None:
+        db.record_event(
+            "execution_circuit_breaker",
+            {
+                "strategy_id": execution.strategy_id,
+                "execution_id": execution.execution_id,
+                "market_id": execution.market_id,
+                "reason": pause.get("reason"),
+                "pause_until": pause.get("pause_until"),
+            },
+            strategy_id=execution.strategy_id,
+        )
 
 
 def print_status(app_config: AppConfig, db: ArenaDB) -> None:
@@ -831,6 +856,7 @@ async def execute_decision(
                 )
                 continue
             db.save_execution(execution)
+            _apply_execution_circuit_breaker(db, execution)
             if position:
                 db.upsert_position(position)
                 portfolio = apply_execution_to_portfolio(portfolio, position, execution)
@@ -1674,9 +1700,31 @@ def main(argv: list[str] | None = None) -> None:
                 "run_monthly_meta_prompt": lambda: run_monthly_meta_prompt(db),
             },
         )
+        shutdown_signal: dict[str, str | None] = {"name": None}
+
+        def _handle_shutdown(signum, _frame) -> None:
+            signame = signal.Signals(signum).name
+            if shutdown_signal["name"] is not None:
+                return
+            shutdown_signal["name"] = signame
+            db.record_event("graceful_shutdown_requested", {"signal": signame})
+            logger.warning("Received %s, shutting down scheduler gracefully", signame)
+            try:
+                scheduler.shutdown(wait=False)
+            except Exception:
+                logger.exception("Scheduler shutdown request failed")
+
+        signal.signal(signal.SIGTERM, _handle_shutdown)
+        signal.signal(signal.SIGINT, _handle_shutdown)
         try:
             scheduler.start()
         finally:
+            if shutdown_signal["name"] is not None:
+                db.record_event("graceful_shutdown", {"signal": shutdown_signal["name"]})
+            try:
+                asyncio.run(execution_services.limit_order_manager.cancel_all())
+            except Exception:
+                logger.exception("Failed to cancel open limit orders during shutdown")
             asyncio.run(execution_services.close())
 
 

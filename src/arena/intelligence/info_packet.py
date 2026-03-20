@@ -30,6 +30,17 @@ research_cache = ResearchCache()
 nexus_rate_limiter = NexusRateLimiter()
 
 
+def _research_provider_label(error_text: str) -> str:
+    lowered = str(error_text or "").lower()
+    if "crawl4ai" in lowered:
+        return "crawl4ai"
+    if "searx" in lowered:
+        return "searxng"
+    if "nexus" in lowered or "perplexia" in lowered:
+        return "nexus"
+    return "research_stack"
+
+
 class InfoPacketBuilder:
     def __init__(self, db: ArenaDB, search_client: SearchClient | None = None, weather_sources: list[WeatherDataSource] | None = None) -> None:
         self.db = db
@@ -814,6 +825,7 @@ class InfoPacketBuilder:
             self._research_stats["nexus_calls"] += 1
         except Exception as exc:
             duration_ms = int((time.time() - start_time) * 1000)
+            stale = self._research_cache.get(cache_key)
             nexus_rate_limiter.set_cooldown()
             self._log_market_research(
                 row=row,
@@ -826,6 +838,18 @@ class InfoPacketBuilder:
                 report_summary_override="Discovery call failed",
             )
             self.db.record_event(
+                "research_provider_degraded",
+                {
+                    "strategy_id": strategy_id,
+                    "market_id": market_id,
+                    "provider": _research_provider_label(str(exc)),
+                    "call_type": "discovery",
+                    "fallback": "cached_discovery" if stale is not None else "none",
+                    "error": str(exc),
+                },
+                strategy_id=strategy_id,
+            )
+            self.db.record_event(
                 "research_call_blocked",
                 {
                     "strategy_id": strategy_id,
@@ -835,6 +859,9 @@ class InfoPacketBuilder:
                     "error": str(exc),
                 },
             )
+            if stale is not None:
+                self._research_stats["cache_hits"] += 1
+                return stale, 1
             return None, 1
 
         duration_ms = int((time.time() - start_time) * 1000)
@@ -999,6 +1026,7 @@ class InfoPacketBuilder:
 
         start_time = time.time()
         result = None
+        used_stale_cache = False
         try:
             result = await research_market(
                 str(row["question"]),
@@ -1013,6 +1041,13 @@ class InfoPacketBuilder:
             self._research_stats["nexus_calls"] += 1
         except Exception as exc:
             duration_ms = int((time.time() - start_time) * 1000)
+            stale = research_cache.get(
+                market_id=market_id,
+                market_type=market_type,
+                current_price=float(current_price) if current_price is not None else None,
+                current_ensemble_mu=float(current_ensemble_mu) if current_ensemble_mu is not None else None,
+                allow_stale=True,
+            )
             self._log_market_research(
                 row=row,
                 strategy_config=strategy_config,
@@ -1023,6 +1058,18 @@ class InfoPacketBuilder:
             )
             # Set cooldown so next scan cycle can retry
             nexus_rate_limiter.set_cooldown()
+            self.db.record_event(
+                "research_provider_degraded",
+                {
+                    "strategy_id": strategy_id,
+                    "market_id": market_id,
+                    "provider": _research_provider_label(str(exc)),
+                    "call_type": "probability",
+                    "fallback": "stale_cache" if stale is not None else "none",
+                    "error": str(exc),
+                },
+                strategy_id=strategy_id,
+            )
             self.db.record_event(
                 "research_call_blocked",
                 {
@@ -1043,13 +1090,23 @@ class InfoPacketBuilder:
                 },
                 strategy_id=strategy_id,
             )
-            result = None
+            result = stale
+            used_stale_cache = stale is not None
 
         if result is None:
             # No result and no exception: enter cooldown so next cycle can retry
             nexus_rate_limiter.set_cooldown()
-            self._research_cache[market_id] = None
-            return None, 1
+            stale = research_cache.get(
+                market_id=market_id,
+                market_type=market_type,
+                current_price=float(current_price) if current_price is not None else None,
+                current_ensemble_mu=float(current_ensemble_mu) if current_ensemble_mu is not None else None,
+                allow_stale=True,
+            )
+            self._research_cache[market_id] = stale
+            if stale is not None:
+                self._research_stats["cache_hits"] += 1
+            return stale, 1 if stale is None else 0
         else:
             self._log_market_research(
                 row=row,
@@ -1058,14 +1115,17 @@ class InfoPacketBuilder:
                 mode=mode,
                 result=result,
                 duration_ms=int((time.time() - start_time) * 1000),
-                from_cache=False,
+                from_cache=used_stale_cache,
             )
-            research_cache.put(
-                market_id=market_id,
-                result=result,
-                market_price=float(current_price) if current_price is not None else None,
-                ensemble_mu=float(current_ensemble_mu) if current_ensemble_mu is not None else None,
-            )
+            if not used_stale_cache:
+                research_cache.put(
+                    market_id=market_id,
+                    result=result,
+                    market_price=float(current_price) if current_price is not None else None,
+                    ensemble_mu=float(current_ensemble_mu) if current_ensemble_mu is not None else None,
+                )
+            else:
+                self._research_stats["cache_hits"] += 1
         self._research_cache[market_id] = result
         return result, 1
 

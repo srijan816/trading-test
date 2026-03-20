@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 
 from arena.db import ArenaDB
 from arena.event_groups import derive_event_group
+from arena.risk.trading_guardrails import compute_daily_pnl, get_active_trading_pause
+from arena.strategies.algo_forecast import parse_weather_question
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,12 @@ class RiskManager:
         self.max_positions_per_market = int(os.getenv("RISK_MAX_POSITIONS_PER_MARKET", "2"))
         self.cooldown_after_loss_streak = config.get("cooldown_after_loss_streak", 3)
         self.cooldown_minutes = config.get("cooldown_minutes", 60)
+        self.max_city_date_concentration_pct = float(
+            os.getenv(
+                "RISK_MAX_CITY_DATE_CONCENTRATION_PCT",
+                str(config.get("max_city_date_concentration_pct", 0.35)),
+            )
+        )
 
     def _current_risk_window_start(self, strategy_id: str) -> str:
         now = datetime.now(timezone.utc)
@@ -135,6 +143,14 @@ class RiskManager:
         venue: str | None = None,
     ) -> dict:
         risk_window_start = self._current_risk_window_start(strategy_id)
+        active_pause = get_active_trading_pause(self.db, strategy_id)
+        if active_pause is not None:
+            return self._reject(
+                "Trading paused by circuit breaker.",
+                strategy_id=strategy_id,
+                pause_until=active_pause.get("pause_until"),
+                pause_reason=active_pause.get("reason"),
+            )
 
         with self.db.connect() as conn:
             # Check 1: Daily trade count
@@ -148,16 +164,15 @@ class RiskManager:
             if daily_trades >= self.max_daily_trades:
                 return {"approved": False, "reason": f"Daily trade limit reached ({daily_trades}/{self.max_daily_trades})"}
 
-            # Check 2: Daily P&L (approximate from total_cost of today's executions)
-            row = conn.execute(
-                "SELECT COALESCE(SUM(total_cost), 0) AS total FROM executions "
-                "WHERE strategy_id = ? AND status IN ('filled', 'partial') "
-                "AND datetime(timestamp) >= datetime(?)",
-                (strategy_id, risk_window_start),
-            ).fetchone()
-            daily_spend = float(row["total"]) if row else 0.0
-            if daily_spend > self.max_daily_loss_usd:
-                return {"approved": False, "reason": f"Daily loss limit reached (${daily_spend:.2f}/${self.max_daily_loss_usd:.2f})"}
+            # Check 2: Daily P&L (realized today + current unrealized)
+            daily_pnl = compute_daily_pnl(self.db, strategy_id, risk_window_start)
+            if daily_pnl <= (-1.0 * float(self.max_daily_loss_usd)):
+                return self._reject(
+                    "Daily P&L limit exceeded.",
+                    strategy_id=strategy_id,
+                    daily_pnl=round(daily_pnl, 2),
+                    daily_loss_cap=round(float(self.max_daily_loss_usd), 2),
+                )
 
             # Check 3: Open position count
             row = conn.execute(
@@ -229,7 +244,17 @@ class RiskManager:
                     cap=round(self.max_total_exposure, 2),
                 )
 
-            # Check 7: Loss streak cooldown
+            # Check 7: Weather city/date concentration
+            concentration_check = self._weather_city_date_concentration_check(
+                strategy_id=strategy_id,
+                market_id=market_id,
+                venue=venue,
+                amount_usd=amount_usd,
+            )
+            if concentration_check is not None:
+                return concentration_check
+
+            # Check 8: Loss streak cooldown
             recent_execs = list(conn.execute(
                 "SELECT status, timestamp FROM executions "
                 "WHERE strategy_id = ? ORDER BY timestamp DESC LIMIT ?",
@@ -248,3 +273,60 @@ class RiskManager:
                         }
 
         return {"approved": True, "reason": "All checks passed"}
+
+    def _weather_city_date_concentration_check(
+        self,
+        *,
+        strategy_id: str,
+        market_id: str,
+        venue: str | None,
+        amount_usd: float,
+    ) -> dict | None:
+        market_row = self.db.get_market(market_id, venue or "polymarket") if venue else None
+        if market_row is None or str(market_row["category"]) != "weather":
+            return None
+        params = parse_weather_question(str(market_row["question"]))
+        if not params:
+            return None
+        target_city = params.canonical_city.lower()
+        target_date = params.date.isoformat()
+
+        exposure = 0.0
+        with self.db.connect() as conn:
+            rows = list(
+                conn.execute(
+                    """
+                    SELECT p.market_id, p.venue, p.quantity, p.avg_entry_price, m.question
+                    FROM positions p
+                    JOIN markets m ON m.market_id = p.market_id AND m.venue = p.venue
+                    WHERE p.strategy_id = ?
+                      AND p.status = 'open'
+                      AND m.category = 'weather'
+                    """,
+                    (strategy_id,),
+                )
+            )
+        for row in rows:
+            other = parse_weather_question(str(row["question"]))
+            if not other:
+                continue
+            if other.canonical_city.lower() == target_city and other.date.isoformat() == target_date:
+                exposure += float(row["quantity"] or 0.0) * float(row["avg_entry_price"] or 0.0)
+
+        portfolio = self.db.get_portfolio(strategy_id)
+        capital_base = max(float(portfolio.total_value if portfolio else 0.0), 1.0)
+        concentration_after = (exposure + float(amount_usd)) / capital_base
+        if concentration_after > self.max_city_date_concentration_pct:
+            return self._reject(
+                "Max weather city/date concentration exceeded.",
+                strategy_id=strategy_id,
+                market_id=market_id,
+                venue=venue,
+                city=params.canonical_city,
+                target_date=target_date,
+                current_city_date_exposure=round(exposure, 2),
+                proposed_trade_size=round(float(amount_usd), 2),
+                concentration_after=round(concentration_after, 4),
+                concentration_cap=round(self.max_city_date_concentration_pct, 4),
+            )
+        return None
