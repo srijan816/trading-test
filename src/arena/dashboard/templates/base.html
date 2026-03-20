@@ -14,28 +14,83 @@
       <div class="sidebar-section">
         <div class="sidebar-title">Navigation</div>
         <nav class="nav-list">
-          {% for item in nav_items %}
-          {% if item.page != "research_pipeline" %}
-          <a href="{{ item.path }}"
-             class="nav-link {% if current_page == item.page %}active{% endif %}"
-             hx-get="{{ item.api_path }}"
+          <a href="/"
+             class="nav-link {% if current_page == 'overview' %}active{% endif %}"
+             hx-get="/api/overview"
              hx-target="#content"
              hx-swap="innerHTML"
-             hx-push-url="{{ item.path }}"
-             hx-on:click="document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active')); this.classList.add('active')">
-            {{ item.label }}
-          </a>
-          {% endif %}
-          {% endfor %}
+             hx-push-url="/"
+             hx-on:click="document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active')); this.classList.add('active')">Overview</a>
+          <a href="/positions"
+             class="nav-link {% if current_page == 'positions' %}active{% endif %}"
+             hx-get="/api/positions"
+             hx-target="#content"
+             hx-swap="innerHTML"
+             hx-push-url="/positions"
+             hx-on:click="document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active')); this.classList.add('active')">Live Positions</a>
+          <a href="/orders"
+             class="nav-link {% if current_page == 'orders' %}active{% endif %}"
+             hx-get="/api/orders"
+             hx-target="#content"
+             hx-swap="innerHTML"
+             hx-push-url="/orders"
+             hx-on:click="document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active')); this.classList.add('active')">Orders</a>
+          <a href="/decisions"
+             class="nav-link {% if current_page == 'decisions' %}active{% endif %}"
+             hx-get="/api/decisions"
+             hx-target="#content"
+             hx-swap="innerHTML"
+             hx-push-url="/decisions"
+             hx-on:click="document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active')); this.classList.add('active')">Decision Log</a>
+          <a href="/execution-funnel"
+             class="nav-link {% if current_page == 'execution_funnel' %}active{% endif %}"
+             hx-get="/api/execution-funnel"
+             hx-target="#content"
+             hx-swap="innerHTML"
+             hx-push-url="/execution-funnel"
+             hx-on:click="document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active')); this.classList.add('active')">Execution Funnel</a>
           <a href="/research-pipeline"
              class="nav-link {% if current_page == 'research_pipeline' %}active{% endif %}"
              hx-get="/api/research-pipeline"
              hx-target="#content"
              hx-swap="innerHTML"
              hx-push-url="/research-pipeline"
-             hx-on:click="document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active')); this.classList.add('active')">
-            Research Pipeline
-          </a>
+             hx-on:click="document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active')); this.classList.add('active')">Research Pipeline</a>
+          <a href="/discovery"
+             class="nav-link {% if current_page == 'discovery' %}active{% endif %}"
+             hx-get="/api/discovery"
+             hx-target="#content"
+             hx-swap="innerHTML"
+             hx-push-url="/discovery"
+             hx-on:click="document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active')); this.classList.add('active')">Discovery</a>
+          <a href="/performance"
+             class="nav-link {% if current_page == 'performance' %}active{% endif %}"
+             hx-get="/api/performance"
+             hx-target="#content"
+             hx-swap="innerHTML"
+             hx-push-url="/performance"
+             hx-on:click="document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active')); this.classList.add('active')">Strategy Performance</a>
+          <a href="/forecast-accuracy"
+             class="nav-link {% if current_page == 'forecast_accuracy' %}active{% endif %}"
+             hx-get="/api/forecast-accuracy"
+             hx-target="#content"
+             hx-swap="innerHTML"
+             hx-push-url="/forecast-accuracy"
+             hx-on:click="document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active')); this.classList.add('active')">Forecast Accuracy</a>
+          <a href="/calibration"
+             class="nav-link {% if current_page == 'calibration' %}active{% endif %}"
+             hx-get="/api/calibration"
+             hx-target="#content"
+             hx-swap="innerHTML"
+             hx-push-url="/calibration"
+             hx-on:click="document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active')); this.classList.add('active')">Calibration</a>
+          <a href="/health"
+             class="nav-link {% if current_page == 'health' %}active{% endif %}"
+             hx-get="/api/health"
+             hx-target="#content"
+             hx-swap="innerHTML"
+             hx-push-url="/health"
+             hx-on:click="document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active')); this.classList.add('active')">System Health</a>
         </nav>
       </div>
     </aside>

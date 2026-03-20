@@ -1,72 +1,67 @@
 <div id="performance-page" class="page" hx-get="/api/performance" hx-trigger="every 30s" hx-swap="outerHTML">
-  {% for section in content.sections %}
-  <section class="card strategy-section">
-    <div class="card-header">
-      <h3>{{ section.name }}</h3>
-      <span class="badge {% if section.status == 'active' %}badge-positive{% else %}badge-neutral{% endif %}">{{ section.status }}</span>
-    </div>
-    <div class="metric-grid metric-grid-wide">
-      <div><div class="metric-label">Total Trades</div><div class="metric-value mono">{{ section.metrics.total_trades|intcomma }}</div></div>
-      <div><div class="metric-label">Win Rate</div><div class="metric-value mono">{{ section.metrics.win_rate|pct }}</div></div>
-      <div><div class="metric-label">Avg Edge</div><div class="metric-value mono">{{ section.metrics.avg_edge_bps|bps }}</div></div>
-      <div><div class="metric-label">Total P&amp;L</div><div class="metric-value mono {% if section.metrics.total_pnl > 0 %}positive{% elif section.metrics.total_pnl < 0 %}negative{% endif %}">{{ section.metrics.total_pnl|money }}</div></div>
-      <div><div class="metric-label">Avg Position</div><div class="metric-value mono">{{ section.metrics.avg_position_size|money }}</div></div>
-      <div><div class="metric-label">Max Drawdown</div><div class="metric-value mono">{{ section.metrics.max_drawdown|money }}</div></div>
-      <div><div class="metric-label">Sharpe Est.</div><div class="metric-value mono">{{ section.metrics.sharpe_estimate|num }}</div></div>
-    </div>
-
-    <div class="subsection-title">Trade History</div>
-    <table class="data-table">
+  <section class="card">
+    <div class="section-title">Strategy Comparison</div>
+    {% if content.sections %}
+    <table class="data-table compact comparison-table">
       <thead>
         <tr>
-          <th>Time</th>
-          <th>Market</th>
-          <th>Side</th>
-          <th class="num">Entry</th>
-          <th class="num">Exit</th>
-          <th class="num">P&amp;L</th>
-          <th class="num">Edge</th>
-          <th>Duration</th>
+          <th>Metric</th>
+          {% for section in content.sections %}
+          <th>{{ section.strategy_id }}</th>
+          {% endfor %}
         </tr>
       </thead>
       <tbody>
-        {% if section.trades %}
-          {% for trade in section.trades %}
-          <tr>
-            <td title="{{ trade.timestamp|timestamp }}">{{ trade.timestamp|relative_time }}</td>
-            <td title="{{ trade.question }}">{{ trade.question[:72] }}{% if trade.question|length > 72 %}…{% endif %}</td>
-            <td>{{ trade.side }}</td>
-            <td class="num mono">{{ trade.entry|num }}</td>
-            <td class="num mono">{{ trade.exit|num }}</td>
-            <td class="num mono {% if trade.pnl and trade.pnl > 0 %}positive{% elif trade.pnl and trade.pnl < 0 %}negative{% endif %}">{{ trade.pnl|money }}</td>
-            <td class="num mono">{{ trade.edge_bps|bps }}</td>
-            <td>{{ trade.duration }}</td>
-          </tr>
+        {% for row in content.comparison_rows %}
+        <tr>
+          <td>{{ row.label }}</td>
+          {% for value in row.values %}
+          <td class="{% if value.tone == 'positive' %}positive{% elif value.tone == 'negative' %}negative{% elif value.tone == 'warning' %}warning{% endif %}">{{ value.text }}</td>
           {% endfor %}
-        {% else %}
-          <tr><td colspan="8" class="empty-state">No executions recorded yet for this strategy.</td></tr>
-        {% endif %}
+        </tr>
+        {% endfor %}
       </tbody>
     </table>
-
-    <div class="subsection-title">Daily P&amp;L</div>
-    {% if section.daily_series %}
-    <div class="bar-chart">
-      {% set max_abs = section.daily_series | map(attribute='pnl') | map('abs') | max %}
-      {% for item in section.daily_series %}
-      <div class="bar-row">
-        <div class="bar-label">{{ item.date }}</div>
-        <div class="bar-track">
-          <div class="bar {% if item.pnl >= 0 %}bar-positive{% else %}bar-negative{% endif %}" style="width: {{ ((item.pnl|abs) / max_abs * 100) if max_abs else 0 }}%"></div>
-        </div>
-        <div class="bar-value mono {% if item.pnl >= 0 %}positive{% else %}negative{% endif %}">{{ item.pnl|money }}</div>
-      </div>
-      {% endfor %}
-    </div>
     {% else %}
-    <div class="empty-state">No daily snapshots yet. The chart will populate after the first daily snapshot is written.</div>
+    <div class="empty-state">No strategy data yet.</div>
     {% endif %}
   </section>
-  {% endfor %}
-</div>
 
+  <section class="grid-cards grid-cards-two">
+    {% for section in content.sections %}
+    <article class="card strategy-card-detail">
+      <div class="card-header">
+        <div>
+          <h3>{{ section.strategy_id }}</h3>
+          <div class="muted">{{ section.name }}</div>
+        </div>
+        <span class="badge badge-{{ section.status_tone }}">{{ section.status_label }}</span>
+      </div>
+
+      <div class="summary-strip">
+        <span>{{ "Weather-only" if section.weather_only else "Multi-market / research" }}</span>
+        <span>{{ "Maker orders" if section.maker_orders else "No maker rows yet" }}</span>
+        <span>{{ "Trade enabled" if section.trade_enabled else "Trade blocked by weather-only scope" }}</span>
+      </div>
+
+      <div class="metric-grid metric-grid-wide">
+        <div><div class="metric-label">Trades</div><div class="metric-value mono">{{ section.trades }}</div></div>
+        <div><div class="metric-label">Wins / Losses</div><div class="metric-value mono">{{ section.wins }} / {{ section.losses }}</div></div>
+        <div><div class="metric-label">Win Rate</div><div class="metric-value mono">{% if section.win_rate is not none %}{{ section.win_rate|pct }}{% else %}-{% endif %}</div></div>
+        <div><div class="metric-label">Realized P&amp;L</div><div class="metric-value mono {% if section.realized_pnl > 0 %}positive{% elif section.realized_pnl < 0 %}negative{% endif %}">{{ section.realized_pnl|money }}</div></div>
+        <div><div class="metric-label">Unrealized P&amp;L</div><div class="metric-value mono {% if section.unrealized_pnl > 0 %}positive{% elif section.unrealized_pnl < 0 %}negative{% endif %}">{{ section.unrealized_pnl|money }}</div></div>
+        <div><div class="metric-label">Sharpe</div><div class="metric-value mono">{% if section.sharpe is not none %}{{ section.sharpe|num }}{% else %}-{% endif %}</div></div>
+        <div><div class="metric-label">Avg Edge</div><div class="metric-value mono">{% if section.avg_edge_bps is not none %}{{ section.avg_edge_bps|bps }}{% else %}-{% endif %}</div></div>
+        <div><div class="metric-label">Avg Duration</div><div class="metric-value mono">{{ section.avg_duration_display }}</div></div>
+        <div><div class="metric-label">Best Trade</div><div class="metric-value mono {% if section.best_trade and section.best_trade.pnl > 0 %}positive{% endif %}">{% if section.best_trade %}{{ section.best_trade.pnl|money }}{% else %}-{% endif %}</div></div>
+        <div><div class="metric-label">Best Market</div><div class="metric-value">{% if section.best_trade %}{{ section.best_trade.question }}{% else %}-{% endif %}</div></div>
+        <div><div class="metric-label">Worst Trade</div><div class="metric-value mono {% if section.worst_trade and section.worst_trade.pnl < 0 %}negative{% endif %}">{% if section.worst_trade %}{{ section.worst_trade.pnl|money }}{% else %}-{% endif %}</div></div>
+        <div><div class="metric-label">Worst Market</div><div class="metric-value">{% if section.worst_trade %}{{ section.worst_trade.question }}{% else %}-{% endif %}</div></div>
+        <div><div class="metric-label">Research Calls</div><div class="metric-value mono">{{ section.research_calls }}</div></div>
+        <div><div class="metric-label">Signals Found</div><div class="metric-value mono">{{ section.signals_found }}</div></div>
+        <div><div class="metric-label">Last Trade</div><div class="metric-value">{% if section.last_trade_at %}{{ section.last_trade_at|relative_time }}{% else %}-{% endif %}</div></div>
+      </div>
+    </article>
+    {% endfor %}
+  </section>
+</div>

@@ -5,6 +5,7 @@ id = "llm_analyst"
 name = "The Analyst"
 type = "llm"
 enabled = true
+trade_enabled = false
 starting_balance = 10000.0
 
 [strategy.model]
@@ -38,10 +39,10 @@ max_order_usd = 100.0
 [strategy.search]
 enabled = true
 provider = "perplexia"
-max_searches_per_cycle = 2
+max_searches_per_cycle = 5
 trigger_conditions = ["always"]
 research_assistant_enabled = true
-research_mode = "standard"
+research_mode = "discovery"
 
 [strategy.persona]
 system_prompt = """

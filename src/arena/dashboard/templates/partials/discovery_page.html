@@ -1,0 +1,80 @@
+<div id="discovery-page" class="page" hx-get="/api/discovery" hx-trigger="every 60s" hx-swap="outerHTML">
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <div class="section-title">Discovery Signals</div>
+        <div class="muted">Research-pipeline signal feed for market-moving discovery events.</div>
+      </div>
+      {% if content.available %}
+      <div class="summary-strip">
+        <span>Searches: <strong class="mono">{{ content.stats.searches }}</strong></span>
+        <span>Signals: <strong class="mono">{{ content.stats.signals_found }}</strong></span>
+        <span>ROI: <strong class="mono">{% if content.stats.roi is not none %}{{ content.stats.roi|num }}x{% else %}-{% endif %}</strong></span>
+      </div>
+      {% endif %}
+    </div>
+
+    {% if not content.available %}
+    <div class="empty-state">Discovery signal feed not yet active. This page is ready for `discovery_alerts` as soon as Agent 4 starts persisting rows.</div>
+    {% else %}
+    <div class="metric-grid metric-grid-wide">
+      <div><div class="metric-label">Last 24h Searches</div><div class="metric-value mono">{{ content.stats.searches }}</div></div>
+      <div><div class="metric-label">Signals Found</div><div class="metric-value mono">{{ content.stats.signals_found }}</div></div>
+      <div><div class="metric-label">Signal Rate</div><div class="metric-value mono">{% if content.stats.signal_rate is not none %}{{ content.stats.signal_rate|pct }}{% else %}-{% endif %}</div></div>
+      <div><div class="metric-label">Signals Acted On</div><div class="metric-value mono">{{ content.stats.acted_on }}</div></div>
+      <div><div class="metric-label">Action Rate</div><div class="metric-value mono">{% if content.stats.action_rate is not none %}{{ content.stats.action_rate|pct }}{% else %}-{% endif %}</div></div>
+      <div><div class="metric-label">Estimated Cost</div><div class="metric-value mono">{{ content.stats.estimated_cost|money }}</div></div>
+      <div><div class="metric-label">Signal P&amp;L</div><div class="metric-value mono {% if content.stats.signal_pnl > 0 %}positive{% elif content.stats.signal_pnl < 0 %}negative{% endif %}">{{ content.stats.signal_pnl|money }}</div></div>
+    </div>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <div class="section-title">Signal Feed</div>
+    {% if not content.available %}
+    <div class="empty-state">No `discovery_alerts` table yet.</div>
+    {% elif content.signals %}
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Type</th>
+          <th>Market</th>
+          <th>Headline</th>
+          <th class="num">Relevance</th>
+          <th>Direction</th>
+          <th>Acted On</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in content.signals %}
+        {% set signal_type = row.type|upper %}
+        <tr class="signal-row signal-{{ signal_type|lower }}">
+          <td title="{{ row.time|timestamp if row.time else 'n/a' }}">{{ row.time|relative_time if row.time else 'n/a' }}</td>
+          <td>
+            <span class="badge {% if signal_type == 'WEATHER_ALERT' %}badge-info{% elif signal_type == 'BREAKING_NEWS' %}badge-negative{% elif signal_type == 'DATA_RELEASE' %}badge-positive{% elif signal_type == 'REGULATORY_CHANGE' %}badge-purple{% else %}badge-neutral{% endif %}">
+              {{ signal_type }}
+            </span>
+          </td>
+          <td title="{{ row.market }}">{{ row.market[:48] }}{% if row.market|length > 48 %}…{% endif %}</td>
+          <td>{{ row.headline }}</td>
+          <td class="num mono">{% if row.relevance is not none %}{{ row.relevance|num }}{% else %}-{% endif %}</td>
+          <td>{{ row.direction }}</td>
+          <td>
+            {% if row.acted_on is none %}
+            -
+            {% elif row.acted_on %}
+            <span class="badge badge-positive">yes</span>
+            {% else %}
+            <span class="badge badge-neutral">no</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">No discovery signals recorded in the selected window.</div>
+    {% endif %}
+  </section>
+</div>

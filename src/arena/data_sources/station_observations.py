@@ -4,10 +4,12 @@ import asyncio
 import logging
 import statistics
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 
 import httpx
 
 from arena.db import ArenaDB
+from arena.data_sources.weather_constants import CITY_TIMEZONES
 
 logger = logging.getLogger(__name__)
 
@@ -299,7 +301,7 @@ async def _fetch_open_meteo_daily_archive(
     latitude: float,
     longitude: float,
     target_date: str,
-) -> tuple[float | None, float | None]:
+) -> dict[str, object]:
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             response = await client.get(
@@ -318,10 +320,155 @@ async def _fetch_open_meteo_daily_archive(
         daily = payload.get("daily", {})
         high = daily.get("temperature_2m_max", [None])[0]
         low = daily.get("temperature_2m_min", [None])[0]
-        return (float(high), float(low) if low is not None else None) if high is not None else (None, None)
+        return {
+            "actual_high_c": float(high) if high is not None else None,
+            "actual_low_c": float(low) if low is not None else None,
+            "observation_source": "open_meteo_archive",
+            "observation_timestamp": f"{target_date}T23:59:59",
+            "raw_response": payload,
+        }
     except Exception as exc:
         logger.warning("Open-Meteo archive fetch failed for %s %s: %s", latitude, longitude, exc)
-        return None, None
+        return {
+            "actual_high_c": None,
+            "actual_low_c": None,
+            "observation_source": "open_meteo_archive",
+            "observation_timestamp": None,
+            "raw_response": None,
+        }
+
+
+def _parse_observation_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    candidate = str(value).replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+async def _fetch_metar_daily_extremes(location_name: str, target_date: str) -> dict[str, object]:
+    icao = ICAO_CODES.get(location_name.lower())
+    if not icao:
+        return {
+            "actual_high_c": None,
+            "actual_low_c": None,
+            "observation_source": None,
+            "observation_timestamp": None,
+        }
+
+    local_tz_name = CITY_TIMEZONES.get(location_name.lower(), "UTC")
+    local_tz = ZoneInfo(local_tz_name)
+    target = date.fromisoformat(target_date)
+    now_local = datetime.now(local_tz)
+    hours_back = max(int((now_local.date() - target).days * 24) + 36, 36)
+    if hours_back > 96:
+        return {
+            "actual_high_c": None,
+            "actual_low_c": None,
+            "observation_source": f"metar_{icao}",
+            "observation_timestamp": None,
+        }
+
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            response = await client.get(
+                "https://aviationweather.gov/api/data/metar",
+                params={"ids": icao, "format": "json", "hours": hours_back},
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except Exception as exc:
+        logger.warning("METAR archive fetch failed for %s (%s): %s", location_name, icao, exc)
+        return {
+            "actual_high_c": None,
+            "actual_low_c": None,
+            "observation_source": f"metar_{icao}",
+            "observation_timestamp": None,
+        }
+
+    observations = payload if isinstance(payload, list) else [payload]
+    temps: list[float] = []
+    latest_time: datetime | None = None
+    for obs in observations:
+        obs_time = _parse_observation_time(obs.get("reportTime") or obs.get("obsTime"))
+        temp = obs.get("temp")
+        if obs_time is None or temp is None:
+            continue
+        if obs_time.astimezone(local_tz).date().isoformat() != target_date:
+            continue
+        temps.append(float(temp))
+        if latest_time is None or obs_time > latest_time:
+            latest_time = obs_time
+
+    if not temps:
+        return {
+            "actual_high_c": None,
+            "actual_low_c": None,
+            "observation_source": f"metar_{icao}",
+            "observation_timestamp": None,
+        }
+
+    return {
+        "actual_high_c": max(temps),
+        "actual_low_c": min(temps),
+        "observation_source": f"metar_{icao}",
+        "observation_timestamp": latest_time.isoformat() if latest_time is not None else None,
+    }
+
+
+async def get_daily_observed_temperature_details(
+    db: ArenaDB | None,
+    latitude: float,
+    longitude: float,
+    location_name: str,
+    target_date: str | date,
+) -> dict[str, object]:
+    target_date_str = target_date.isoformat() if isinstance(target_date, date) else str(target_date)
+
+    if db is not None:
+        cached_high, cached_low = _query_cached_daily_temperatures(db, location_name, target_date_str)
+        if cached_high is not None:
+            return {
+                "actual_high_c": cached_high,
+                "actual_low_c": cached_low,
+                "observation_source": "cached_station_observations",
+                "observation_timestamp": f"{target_date_str}T23:59:59",
+                "observation_secondary_source": None,
+                "observation_secondary_high_c": None,
+                "observation_disagreement_c": None,
+            }
+
+    primary = await _fetch_open_meteo_daily_archive(latitude, longitude, target_date_str)
+    secondary = await _fetch_metar_daily_extremes(location_name, target_date_str)
+
+    primary_high = primary.get("actual_high_c")
+    secondary_high = secondary.get("actual_high_c")
+    disagreement = None
+    if primary_high is not None and secondary_high is not None:
+        disagreement = abs(float(primary_high) - float(secondary_high))
+        if disagreement > 2.0:
+            logger.warning(
+                "Resolution source disagreement for %s on %s: primary=%.1fC, secondary=%.1fC",
+                location_name,
+                target_date_str,
+                float(primary_high),
+                float(secondary_high),
+            )
+
+    return {
+        "actual_high_c": primary_high,
+        "actual_low_c": primary.get("actual_low_c"),
+        "observation_source": primary.get("observation_source"),
+        "observation_timestamp": primary.get("observation_timestamp"),
+        "observation_secondary_source": secondary.get("observation_source"),
+        "observation_secondary_high_c": secondary_high,
+        "observation_disagreement_c": round(float(disagreement), 3) if disagreement is not None else None,
+    }
 
 
 async def get_daily_observed_temperatures(
@@ -331,11 +478,11 @@ async def get_daily_observed_temperatures(
     location_name: str,
     target_date: str | date,
 ) -> tuple[float | None, float | None]:
-    target_date_str = target_date.isoformat() if isinstance(target_date, date) else str(target_date)
-
-    if db is not None:
-        cached_high, cached_low = _query_cached_daily_temperatures(db, location_name, target_date_str)
-        if cached_high is not None:
-            return cached_high, cached_low
-
-    return await _fetch_open_meteo_daily_archive(latitude, longitude, target_date_str)
+    details = await get_daily_observed_temperature_details(
+        db=db,
+        latitude=latitude,
+        longitude=longitude,
+        location_name=location_name,
+        target_date=target_date,
+    )
+    return details.get("actual_high_c"), details.get("actual_low_c")

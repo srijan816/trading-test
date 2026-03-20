@@ -5,6 +5,7 @@ id = "llm_news_trader"
 name = "The News Trader"
 type = "llm"
 enabled = true
+trade_enabled = false
 starting_balance = 10000.0
 
 [strategy.model]
@@ -38,11 +39,11 @@ max_order_usd = 100.0
 enabled = true
 provider = "perplexia"
 research_assistant_enabled = true
-research_mode = "standard"
+research_mode = "discovery"
 mode = "standard"
 output_length = "short"
 max_sources = 5
-max_searches_per_cycle = 3
+max_searches_per_cycle = 5
 trigger_conditions = ["always"]
 
 [strategy.persona]

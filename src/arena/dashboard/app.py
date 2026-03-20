@@ -28,8 +28,11 @@ dashboard = DashboardQueries()
 NAV_ITEMS = [
     {"label": "Overview", "path": "/", "api_path": "/api/overview", "page": "overview"},
     {"label": "Live Positions", "path": "/positions", "api_path": "/api/positions", "page": "positions"},
+    {"label": "Orders", "path": "/orders", "api_path": "/api/orders", "page": "orders"},
     {"label": "Decision Log", "path": "/decisions", "api_path": "/api/decisions", "page": "decisions"},
+    {"label": "Execution Funnel", "path": "/execution-funnel", "api_path": "/api/execution-funnel", "page": "execution_funnel"},
     {"label": "Research Pipeline", "path": "/research-pipeline", "api_path": "/api/research-pipeline", "page": "research_pipeline"},
+    {"label": "Discovery", "path": "/discovery", "api_path": "/api/discovery", "page": "discovery"},
     {"label": "Strategy Performance", "path": "/performance", "api_path": "/api/performance", "page": "performance"},
     {"label": "Forecast Accuracy", "path": "/forecast-accuracy", "api_path": "/api/forecast-accuracy", "page": "forecast_accuracy"},
     {"label": "Calibration", "path": "/calibration", "api_path": "/api/calibration", "page": "calibration"},
@@ -92,6 +95,11 @@ def positions_page(request: Request) -> HTMLResponse:
     return render_full(request, "positions", "partials/positions_page.html", dashboard.get_positions_page())
 
 
+@app.get("/orders", response_class=HTMLResponse)
+def orders_page(request: Request) -> HTMLResponse:
+    return render_full(request, "orders", "partials/orders_page.html", dashboard.get_orders_page())
+
+
 @app.get("/decisions", response_class=HTMLResponse)
 def decisions_page(
     request: Request,
@@ -101,6 +109,16 @@ def decisions_page(
 ) -> HTMLResponse:
     data = dashboard.get_decision_log(strategy=strategy, action_filter=action_filter, date_range=date_range)
     return render_full(request, "decisions", "partials/decision_log_page.html", data)
+
+
+@app.get("/execution-funnel", response_class=HTMLResponse)
+def execution_funnel_page(
+    request: Request,
+    strategy: str = Query("all"),
+    hours: int = Query(24),
+) -> HTMLResponse:
+    data = dashboard.get_execution_funnel_page(strategy=strategy, hours=hours)
+    return render_full(request, "execution_funnel", "partials/execution_funnel_page.html", data)
 
 
 @app.get("/performance", response_class=HTMLResponse)
@@ -117,6 +135,11 @@ def research_pipeline_page(
 ) -> HTMLResponse:
     data = dashboard.get_research_pipeline(strategy=strategy, endpoint=endpoint, date_range=date_range)
     return render_full(request, "research_pipeline", "partials/research_pipeline_page.html", data)
+
+
+@app.get("/discovery", response_class=HTMLResponse)
+def discovery_page(request: Request) -> HTMLResponse:
+    return render_full(request, "discovery", "partials/discovery_page.html", dashboard.get_discovery_page())
 
 
 @app.get("/forecast-accuracy", response_class=HTMLResponse)
@@ -155,6 +178,11 @@ def api_positions(request: Request) -> HTMLResponse:
     return render_partial(request, "partials/positions_page.html", dashboard.get_positions_page())
 
 
+@app.get("/api/orders", response_class=HTMLResponse)
+def api_orders(request: Request) -> HTMLResponse:
+    return render_partial(request, "partials/orders_page.html", dashboard.get_orders_page())
+
+
 @app.get("/api/decisions", response_class=HTMLResponse)
 def api_decisions(
     request: Request,
@@ -164,6 +192,16 @@ def api_decisions(
 ) -> HTMLResponse:
     data = dashboard.get_decision_log(strategy=strategy, action_filter=action_filter, date_range=date_range)
     return render_partial(request, "partials/decision_log_page.html", data)
+
+
+@app.get("/api/execution-funnel", response_class=HTMLResponse)
+def api_execution_funnel(
+    request: Request,
+    strategy: str = Query("all"),
+    hours: int = Query(24),
+) -> HTMLResponse:
+    data = dashboard.get_execution_funnel_page(strategy=strategy, hours=hours)
+    return render_partial(request, "partials/execution_funnel_page.html", data)
 
 
 @app.get("/api/decision/{decision_id}", response_class=HTMLResponse)
@@ -192,6 +230,11 @@ def api_research_pipeline(
 ) -> HTMLResponse:
     data = dashboard.get_research_pipeline(strategy=strategy, endpoint=endpoint, date_range=date_range)
     return render_partial(request, "partials/research_pipeline_page.html", data)
+
+
+@app.get("/api/discovery", response_class=HTMLResponse)
+def api_discovery(request: Request) -> HTMLResponse:
+    return render_partial(request, "partials/discovery_page.html", dashboard.get_discovery_page())
 
 
 @app.get("/api/research/{research_id}", response_class=HTMLResponse)

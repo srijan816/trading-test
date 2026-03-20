@@ -4,6 +4,9 @@ name = "Forecast Consensus"
 type = "algo"
 enabled = true
 starting_balance = 10000.0
+min_market_volume_usd = 500
+max_opportunities_per_cycle = 5
+time_decay_enabled = true
 
 [strategy.schedule]
 cadence_minutes = 30
@@ -27,7 +30,14 @@ min_edge_bps = 1500
 [strategy.search]
 enabled = true
 provider = "perplexia"
-max_searches_per_cycle = 3
+max_searches_per_cycle = 10
 trigger_conditions = ["always"]
 research_assistant_enabled = true
-research_mode = "standard"
+research_mode = "discovery"
+
+[strategy.time_decay]
+hours_24_plus = 1.0
+hours_12_to_24 = 0.8
+hours_6_to_12 = 0.6
+hours_2_to_6 = 0.4
+hours_under_2 = 0.2

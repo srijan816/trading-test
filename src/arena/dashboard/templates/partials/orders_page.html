@@ -1,0 +1,114 @@
+<div id="orders-page" class="page" hx-get="/api/orders" hx-trigger="every 15s" hx-swap="outerHTML">
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <div class="section-title">Maker Order Lifecycle</div>
+        <div class="muted">Resting quote visibility for the limit-order engine.</div>
+      </div>
+      {% if content.available %}
+      <div class="summary-strip">
+        <span>Open Orders: <strong class="mono">{{ content.stats.open_orders }}</strong></span>
+        <span>Pending: <strong class="mono">{{ content.stats.open_notional|money }}</strong></span>
+        <span>Fill Rate: <strong class="mono">{% if content.stats.fill_rate is not none %}{{ content.stats.fill_rate|pct }}{% else %}-{% endif %}</strong></span>
+      </div>
+      {% endif %}
+    </div>
+
+    {% if not content.available %}
+    <div class="empty-state">Limit order system not yet active. This page will light up automatically once `limit_orders` starts receiving rows.</div>
+    {% else %}
+    <div class="metric-grid metric-grid-wide">
+      <div><div class="metric-label">Open Orders</div><div class="metric-value mono">{{ content.stats.open_orders }}</div></div>
+      <div><div class="metric-label">Pending Notional</div><div class="metric-value mono">{{ content.stats.open_notional|money }}</div></div>
+      <div><div class="metric-label">Fill Rate</div><div class="metric-value mono">{% if content.stats.fill_rate is not none %}{{ content.stats.fill_rate|pct }}{% else %}-{% endif %}</div></div>
+      <div><div class="metric-label">Avg Time to Fill</div><div class="metric-value mono">{{ content.stats.avg_time_to_fill_display }}</div></div>
+      <div><div class="metric-label">Avg Slippage</div><div class="metric-value mono">{% if content.stats.avg_slippage_cents is not none %}{{ content.stats.avg_slippage_cents|num }}c{% else %}-{% endif %}</div></div>
+      <div><div class="metric-label">Cancelled / Expired</div><div class="metric-value mono">{% if content.stats.cancelled_expired_rate is not none %}{{ content.stats.cancelled_expired_rate|pct }}{% else %}-{% endif %}</div></div>
+      <div><div class="metric-label">Lifecycle</div><div class="metric-value">{{ "live" if content.open_orders else "idle" }}</div></div>
+    </div>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <div class="section-title">Open Orders</div>
+    {% if not content.available %}
+    <div class="empty-state">Waiting for the maker engine to create the `limit_orders` table.</div>
+    {% elif content.open_orders %}
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Order ID</th>
+          <th>Market</th>
+          <th>Side</th>
+          <th class="num">Price</th>
+          <th class="num">Size</th>
+          <th>Status</th>
+          <th>Age</th>
+          <th class="num">Edge</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in content.open_orders %}
+        <tr>
+          <td class="mono">{{ row.order_id }}</td>
+          <td title="{{ row.market }}">{{ row.market[:72] }}{% if row.market|length > 72 %}…{% endif %}</td>
+          <td>{{ row.side }}</td>
+          <td class="num mono">{{ row.price|money }}</td>
+          <td class="num mono">{{ row.size|money }}</td>
+          <td><span class="badge badge-info">{{ row.status }}</span></td>
+          <td>{{ row.age }}</td>
+          <td class="num mono">{% if row.edge_bps is not none %}{{ row.edge_bps|bps }}{% else %}-{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">No open maker orders right now.</div>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <div class="section-title">Order History</div>
+    {% if not content.available %}
+    <div class="empty-state">Historical lifecycle rows will appear here once the maker engine starts persisting orders.</div>
+    {% elif content.history %}
+    <table class="data-table compact">
+      <thead>
+        <tr>
+          <th>Updated</th>
+          <th>Order ID</th>
+          <th>Market</th>
+          <th>Side</th>
+          <th class="num">Limit</th>
+          <th class="num">Fill</th>
+          <th class="num">Size</th>
+          <th>Status</th>
+          <th>Reason</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in content.history %}
+        {% set status = row.status|lower %}
+        <tr>
+          <td title="{{ row.updated_at|timestamp if row.updated_at else 'n/a' }}">{{ row.updated_at|relative_time if row.updated_at else 'n/a' }}</td>
+          <td class="mono">{{ row.order_id }}</td>
+          <td title="{{ row.market }}">{{ row.market[:56] }}{% if row.market|length > 56 %}…{% endif %}</td>
+          <td>{{ row.side }}</td>
+          <td class="num mono">{{ row.price|money }}</td>
+          <td class="num mono">{% if row.fill_price is not none %}{{ row.fill_price|money }}{% else %}-{% endif %}</td>
+          <td class="num mono">{{ row.size|money }}</td>
+          <td>
+            <span class="badge {% if status == 'filled' %}badge-positive{% elif status == 'cancelled' %}badge-neutral{% elif status == 'expired' %}badge-warning{% elif status == 'rejected' %}badge-negative{% else %}badge-info{% endif %}">
+              {{ row.status }}
+            </span>
+          </td>
+          <td>{{ row.cancel_reason or "-" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">No order history yet.</div>
+    {% endif %}
+  </section>
+</div>

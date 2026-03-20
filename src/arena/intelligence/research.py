@@ -62,6 +62,63 @@ def _build_market_findings(result: dict) -> list[str]:
     return findings[:5]
 
 
+async def research_topic(
+    query: str,
+    *,
+    mode: str = "standard",
+    output_length: str = "short",
+    max_sources: int = 3,
+    model: str | None = None,
+    session_id: str | None = None,
+) -> dict | None:
+    """Run a generic Nexus research query and normalize the response."""
+
+    client = PerplexiaSearchClient(
+        mode=mode,
+        output_length=output_length,
+        max_sources=max_sources,
+        model=model,
+        session_id=session_id,
+    )
+    results = await client.search(query, num_results=max_sources)
+    if not results:
+        return None
+
+    primary = results[0]
+    metadata = primary.metadata if isinstance(primary.metadata, dict) else {}
+    report = str(metadata.get("report", "") or primary.snippet or "").strip()
+    sources_detail = [
+        {
+            "url": str(item.url or ""),
+            "title": str(item.title or "Untitled source"),
+            "snippet": str(item.snippet or ""),
+        }
+        for item in results
+        if item.url and not str(item.url).startswith("perplexia://")
+    ][:max_sources]
+    sources = [item["url"] for item in sources_detail if item.get("url")]
+    findings = _extract_findings(report, [item.snippet for item in results[1:]])
+    if not report and not findings and not sources:
+        return None
+
+    return {
+        "provider": "perplexia",
+        "query": query,
+        "mode": str(metadata.get("mode", client.mode) or client.mode),
+        "summary": report[:1800],
+        "findings": findings[:5],
+        "sources": sources,
+        "sources_detail": sources_detail,
+        "follow_ups": [str(item) for item in metadata.get("follow_ups", []) if item],
+        "session_id": metadata.get("session_id"),
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "full_report": report[:12000],
+        "model_used": metadata.get("model_used"),
+        "endpoint": str(metadata.get("endpoint", "/api/v1/research")),
+        "fallback_used": False,
+    }
+
+
 async def research_market(
     market_question: str,
     mode: str = "standard",
@@ -100,40 +157,20 @@ async def research_market(
     except Exception as exc:
         logger.warning("Structured market research unavailable for '%s': %s", market_question, exc)
         try:
-            results = await client.search(query, num_results=5)
+            result = await research_topic(
+                query,
+                mode=mode,
+                output_length="short",
+                max_sources=5,
+                model=model,
+            )
         except Exception as fallback_exc:
             logger.warning("Research assistant unavailable for '%s': %s", market_question, fallback_exc)
             return None
-        if not results:
+        if not result:
             return None
-
-        primary = results[0]
-        metadata = primary.metadata if isinstance(primary.metadata, dict) else {}
-        resolved_mode = str(metadata.get("mode", client.mode) or client.mode)
-        summary = str(metadata.get("report", "") or primary.snippet or "").strip()
-        findings = _extract_findings(summary, [item.snippet for item in results[1:]])
-        sources = [item.url for item in results if item.url and not item.url.startswith("perplexia://")]
-        if not findings and not sources and not summary:
-            return None
-        return {
-            "provider": "perplexia",
-            "query": query,
-            "mode": resolved_mode,
-            "summary": summary[:1800],
-            "findings": findings[:5],
-            "sources": sources[:5],
-            "sources_detail": [
-                {"url": item.url, "title": item.title}
-                for item in results
-                if item.url and not item.url.startswith("perplexia://")
-            ][:5],
-            "session_id": metadata.get("session_id"),
-            "retrieved_at": datetime.now(timezone.utc).isoformat(),
-            "full_report": summary[:6000],
-            "model_used": metadata.get("model_used"),
-            "endpoint": "/api/v1/research",
-            "fallback_used": True,
-        }
+        result["fallback_used"] = True
+        return result
 
     sources = [str(item.get("url")) for item in (market_result.get("sources") or []) if item.get("url")]
     findings = _build_market_findings(market_result)

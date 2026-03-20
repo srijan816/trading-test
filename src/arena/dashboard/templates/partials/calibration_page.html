@@ -1,145 +1,119 @@
 <div id="calibration-page" class="page" hx-get="/api/calibration" hx-trigger="every 30s" hx-swap="outerHTML">
   <section class="card">
-    <div class="section-title">Strategy Health</div>
-    {% if content.strategy_health %}
+    <div class="card-header">
+      <div>
+        <div class="section-title">City Calibration</div>
+        <div class="muted">CRPS and Brier health by city, with a hard tradeability cutoff at 5.0x calibration ratio.</div>
+      </div>
+      <div class="summary-strip">
+        <span>Cities tracked: <strong class="mono">{{ content.city_rows|length }}</strong></span>
+        <span>Tradeable: <strong class="mono">{{ content.city_rows|selectattr('tradeable')|list|length }}</strong></span>
+      </div>
+    </div>
+
+    {% if content.city_rows %}
     <table class="data-table">
       <thead>
         <tr>
-          <th>Strategy</th>
+          <th>City</th>
+          <th class="num">Markets</th>
+          <th class="num">CRPS</th>
+          <th class="num">Ratio</th>
           <th class="num">Brier</th>
-          <th class="num">Cal Error</th>
-          <th class="num">Overconfidence</th>
-          <th class="num">Sample Size</th>
+          <th class="num">Sigma (current)</th>
+          <th class="num">Sigma (recommended)</th>
+          <th>Tradeable</th>
         </tr>
       </thead>
       <tbody>
-        {% for row in content.strategy_health %}
+        {% for row in content.city_rows %}
         <tr>
-          <td>{{ row.strategy_id }}</td>
-          <td class="num mono">{{ row.rolling_brier|num }}</td>
-          <td class="num mono">{{ row.calibration_error|num }}</td>
-          <td class="num mono">{{ row.overconfidence_rate|num }}</td>
-          <td class="num mono">{{ row.sample_size }}</td>
+          <td>{{ row.city }}</td>
+          <td class="num mono">{{ row.markets }}</td>
+          <td class="num mono">{{ row.crps|num }}</td>
+          <td class="num mono {% if row.ratio and row.ratio > 5 %}negative{% elif row.ratio and row.ratio > 2 %}warning{% else %}positive{% endif %}">{% if row.ratio is not none %}{{ row.ratio|num }}x{% else %}-{% endif %}</td>
+          <td class="num mono">{% if row.brier is not none %}{{ row.brier|num }}{% else %}-{% endif %}</td>
+          <td class="num mono">{{ row.sigma_current|num }}</td>
+          <td class="num mono">{{ row.sigma_recommended|num }}</td>
+          <td>
+            {% if row.tradeable %}
+            <span class="badge badge-positive">yes</span>
+            {% else %}
+            <span class="badge badge-negative">{{ row.tradeable_reason }}</span>
+            {% endif %}
+          </td>
         </tr>
         {% endfor %}
       </tbody>
     </table>
     {% else %}
-    <div class="empty-state">Calibration data will appear after markets resolve.</div>
+    <div class="empty-state">Calibration data not yet available.</div>
     {% endif %}
   </section>
 
   <section class="card">
-    <div class="section-title">Calibration Curve</div>
-    {% if content.calibration_curve %}
-    <table class="data-table">
-      <thead>
-        <tr>
-          <th>Predicted Bin</th>
-          <th class="num">Mean Pred</th>
-          <th class="num">Mean Actual</th>
-          <th class="num">Count</th>
-          <th>Status</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for row in content.calibration_curve %}
-        <tr>
-          <td>{{ row.label }}</td>
-          <td class="num mono">{{ row.mean_pred|pct }}</td>
-          <td class="num mono">{{ row.mean_actual|pct }}</td>
-          <td class="num mono">{{ row.count }}</td>
-          <td>{% if row.status == 'good' %}✓{% elif row.status == 'warn' %}⚠{% else %}✗{% endif %}</td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <div class="section-title">Calibration Trend Charts</div>
+    {% if content.city_rows %}
+    <div class="grid-cards grid-cards-two">
+      {% for row in content.city_rows %}
+      <article class="mini-card">
+        <div class="card-header">
+          <div class="subsection-title">{{ row.city }}</div>
+          <div class="muted">Ratio {% if row.ratio is not none %}{{ row.ratio|num }}x{% else %}-{% endif %}</div>
+        </div>
+        {% if row.series %}
+        <svg viewBox="0 0 {{ row.chart.width }} {{ row.chart.height }}" class="ratio-chart" role="img" aria-label="Calibration ratio trend for {{ row.city }}">
+          <line x1="16" y1="{{ row.chart.line_one_y }}" x2="{{ row.chart.width - 16 }}" y2="{{ row.chart.line_one_y }}" class="chart-guide chart-guide-good"></line>
+          <line x1="16" y1="{{ row.chart.line_cutoff_y }}" x2="{{ row.chart.width - 16 }}" y2="{{ row.chart.line_cutoff_y }}" class="chart-guide chart-guide-cutoff"></line>
+          <polyline points="{{ row.chart.points }}" class="chart-line"></polyline>
+        </svg>
+        <div class="chart-axis">
+          <span>{{ row.chart.start_label }}</span>
+          <span>1.0 ideal / 5.0 cutoff</span>
+          <span>{{ row.chart.end_label }}</span>
+        </div>
+        {% else %}
+        <div class="empty-state">Need more resolved markets to plot a trend.</div>
+        {% endif %}
+      </article>
+      {% endfor %}
+    </div>
     {% else %}
-    <div class="empty-state">No scored decisions yet.</div>
+    <div class="empty-state">Trend charts will appear after CRPS history is available.</div>
     {% endif %}
   </section>
 
   <section class="card">
-    <div class="section-title">Pending Parameter Adjustments</div>
-    {% if content.adjustments %}
-    <table class="data-table">
+    <div class="section-title">Parameter Adjustment History</div>
+    {% if content.adjustment_rows %}
+    <table class="data-table compact">
       <thead>
         <tr>
-          <th>Strategy</th>
+          <th>Date</th>
+          <th>Strategy / City</th>
           <th>Parameter</th>
-          <th class="num">Current</th>
-          <th class="num">Recommended</th>
+          <th class="num">Old</th>
+          <th class="num">New</th>
+          <th>Applied</th>
           <th>Reason</th>
         </tr>
       </thead>
       <tbody>
-        {% for row in content.adjustments %}
+        {% for row in content.adjustment_rows %}
         <tr>
+          <td title="{{ row.created_at|timestamp if row.created_at else 'n/a' }}">{{ row.created_at|relative_time if row.created_at else 'n/a' }}</td>
           <td>{{ row.strategy_id }}</td>
           <td>{{ row.parameter_name }}</td>
           <td class="num mono">{{ row.current_value|num }}</td>
           <td class="num mono">{{ row.recommended_value|num }}</td>
+          <td>{% if row.auto_applied %}<span class="badge badge-positive">yes</span>{% else %}<span class="badge badge-neutral">no</span>{% endif %}</td>
           <td>{{ row.reason }}</td>
         </tr>
         {% endfor %}
       </tbody>
     </table>
     {% else %}
-    <div class="empty-state">No adjustments recommended yet.</div>
+    <div class="empty-state">No parameter adjustments recorded yet.</div>
     {% endif %}
   </section>
-
-  <section class="card">
-    <div class="section-title">Sigma Calibration Reference</div>
-    <div class="metric-grid metric-grid-wide">
-      <div><div class="metric-label">Best Method</div><div class="metric-value mono">{{ content.sigma_reference.best_method or "n/a" }}</div></div>
-      <div><div class="metric-label">Sigma Multiplier</div><div class="metric-value mono">{{ content.sigma_reference.best_sigma_multiplier|num }}</div></div>
-      <div><div class="metric-label">Best Brier</div><div class="metric-value mono">{{ content.sigma_reference.best_brier|num }}</div></div>
-    </div>
-    <div class="two-col">
-      <article>
-        <div class="subsection-title">Per-Location Multipliers</div>
-        <table class="data-table compact">
-          <thead>
-            <tr>
-              <th>Location</th>
-              <th>Method</th>
-              <th class="num">Sigma Mult</th>
-              <th class="num">Brier</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for location, item in (content.sigma_reference.per_location or {}).items() %}
-            <tr>
-              <td>{{ location }}</td>
-              <td>{{ item.method }}</td>
-              <td class="num mono">{{ item.sigma_mult|num }}</td>
-              <td class="num mono">{{ item.brier|num }}</td>
-            </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </article>
-      <article>
-        <div class="subsection-title">Source RMSE</div>
-        <table class="data-table compact">
-          <thead>
-            <tr>
-              <th>Source</th>
-              <th>Reference</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for source, item in (content.sigma_reference.source_rmse or {}).items() %}
-            <tr>
-              <td>{{ source }}</td>
-              <td class="mono">{{ item }}</td>
-            </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </article>
-    </div>
-  </section>
 </div>
-

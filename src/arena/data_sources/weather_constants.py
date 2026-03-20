@@ -32,6 +32,36 @@ SOURCE_BIAS = {
     },
 }
 
+CITY_TIMEZONES = {
+    "hong kong": "Asia/Hong_Kong",
+    "chicago": "America/Chicago",
+    "london": "Europe/London",
+    "tokyo": "Asia/Tokyo",
+    "seoul": "Asia/Seoul",
+    "lucknow": "Asia/Kolkata",
+    "new york": "America/New_York",
+    "atlanta": "America/New_York",
+    "ankara": "Europe/Istanbul",
+    "buenos aires": "America/Argentina/Buenos_Aires",
+    "seattle": "America/Los_Angeles",
+    "toronto": "America/Toronto",
+    "taipei": "Asia/Taipei",
+}
+
+CITY_ALIASES = {
+    "new york city": "New York",
+    "nyc": "New York",
+    "hk": "Hong Kong",
+    "la": "Los Angeles",
+}
+
+
+def normalize_weather_city(city: str) -> str:
+    cleaned = " ".join(str(city or "").strip().split())
+    if not cleaned:
+        return cleaned
+    return CITY_ALIASES.get(cleaned.lower(), cleaned)
+
 
 def _invert_source_bias(source_bias: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
     by_location: dict[str, dict[str, float]] = {}

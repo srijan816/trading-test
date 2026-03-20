@@ -1,18 +1,202 @@
 from __future__ import annotations
 
-import logging
-from datetime import date, datetime, timezone
 import json
+import logging
 import math
 import re
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
+from typing import Mapping
 
-from arena.adapters.weather_openmeteo import CITY_COORDS
+from arena.adapters.weather_openmeteo import CITY_COORDS, OpenMeteoSource
 from arena.data_sources.station_observations import ObservationUnavailable, get_current_observations
+from arena.data_sources.weather_constants import normalize_weather_city
 from arena.data_sources.weather_ensemble import WeatherDataUnavailable, get_ensemble_forecast
 from arena.intelligence.output_parser import parse_decision_payload
 from arena.strategies.base import Strategy
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_TIME_DECAY = {
+    "hours_24_plus": 1.0,
+    "hours_12_to_24": 0.8,
+    "hours_6_to_12": 0.6,
+    "hours_2_to_6": 0.4,
+    "hours_under_2": 0.2,
+}
+
+TEMPERATURE_PATTERN = re.compile(
+    r"^Will the (?P<metric>highest|lowest) temperature in (?P<city>.+?) "
+    r"be (?P<body>.+?) on (?P<date>[A-Z][a-z]+ \d{1,2}(?:, \d{4})?)\?$",
+    re.IGNORECASE,
+)
+RAIN_PATTERN = re.compile(
+    r"^Will it rain in (?P<city>.+?) on (?P<date>[A-Z][a-z]+ \d{1,2}(?:, \d{4})?)\?$",
+    re.IGNORECASE,
+)
+
+
+@dataclass(slots=True)
+class WeatherMarketParams:
+    city: str
+    canonical_city: str
+    metric: str
+    direction: str
+    date: date
+    unit: str
+    threshold: float | None = None
+    lower_bound: float | None = None
+    upper_bound: float | None = None
+    dated: bool = True
+
+    @property
+    def shape(self) -> str:
+        mapping = {
+            "above": "at_or_above",
+            "below": "at_or_below",
+            "between": "between",
+            "exact": "exact",
+            "rain": "rain",
+        }
+        return mapping[self.direction]
+
+    def to_contract_dict(self) -> dict:
+        return {
+            "city": self.canonical_city,
+            "display_city": self.city,
+            "forecast_date": self.date,
+            "metric": self.metric,
+            "direction": self.direction,
+            "shape": self.shape,
+            "unit": self.unit,
+            "threshold": self.threshold,
+            "lower": self.lower_bound,
+            "upper": self.upper_bound,
+            "dated": self.dated,
+        }
+
+
+def _parse_question_date(date_text: str) -> date:
+    now = datetime.now(timezone.utc)
+    text = date_text.strip()
+    for fmt in ("%B %d, %Y", "%B %d %Y", "%B %d"):
+        try:
+            parsed = datetime.strptime(text, fmt).date()
+            if fmt == "%B %d":
+                return parsed.replace(year=now.year)
+            return parsed
+        except ValueError:
+            continue
+    raise ValueError(f"Unsupported weather market date: {date_text}")
+
+
+def parse_weather_question(question: str) -> WeatherMarketParams | None:
+    text = " ".join(str(question or "").strip().split())
+    if not text:
+        return None
+
+    rain_match = RAIN_PATTERN.match(text)
+    if rain_match:
+        city = rain_match.group("city").strip()
+        parsed_date = _parse_question_date(rain_match.group("date"))
+        return WeatherMarketParams(
+            city=city,
+            canonical_city=normalize_weather_city(city),
+            metric="rain",
+            direction="rain",
+            date=parsed_date,
+            unit="probability",
+        )
+
+    match = TEMPERATURE_PATTERN.match(text)
+    if not match:
+        return None
+
+    metric = "high" if match.group("metric").lower() == "highest" else "low"
+    city = match.group("city").strip()
+    parsed_date = _parse_question_date(match.group("date"))
+    body = match.group("body").strip()
+
+    between_match = re.search(
+        r"between\s+(-?\d+(?:\.\d+)?)\s*°?\s*([CF])\s*(?:and|-)\s*(-?\d+(?:\.\d+)?)\s*°?\s*\2",
+        body,
+        re.IGNORECASE,
+    )
+    if not between_match:
+        between_match = re.search(
+            r"between\s+(-?\d+(?:\.\d+)?)\s*-\s*(-?\d+(?:\.\d+)?)\s*°?\s*([CF])",
+            body,
+            re.IGNORECASE,
+        )
+    if between_match:
+        lower = float(between_match.group(1))
+        if between_match.lastindex == 3 and between_match.group(2).isalpha():
+            unit = between_match.group(2).lower()
+            upper = float(between_match.group(3))
+        else:
+            upper = float(between_match.group(2))
+            unit = between_match.group(3).lower()
+        return WeatherMarketParams(
+            city=city,
+            canonical_city=normalize_weather_city(city),
+            metric=metric,
+            direction="between",
+            date=parsed_date,
+            unit=unit,
+            threshold=(lower + upper) / 2.0,
+            lower_bound=lower,
+            upper_bound=upper,
+        )
+
+    threshold_match = re.search(
+        r"(-?\d+(?:\.\d+)?)\s*°?\s*([CF])(?:\s*or\s*(above|below|higher|lower))?$",
+        body,
+        re.IGNORECASE,
+    )
+    if not threshold_match:
+        return None
+
+    threshold = float(threshold_match.group(1))
+    unit = threshold_match.group(2).lower()
+    direction_text = (threshold_match.group(3) or "").lower()
+    direction = "exact"
+    if direction_text in {"above", "higher"}:
+        direction = "above"
+    elif direction_text in {"below", "lower"}:
+        direction = "below"
+
+    return WeatherMarketParams(
+        city=city,
+        canonical_city=normalize_weather_city(city),
+        metric=metric,
+        direction=direction,
+        date=parsed_date,
+        unit=unit,
+        threshold=threshold,
+    )
+
+
+def compute_time_decay_multiplier(
+    end_time: datetime,
+    now: datetime | None = None,
+    decay_config: Mapping[str, float] | None = None,
+) -> float:
+    now = now or datetime.now(timezone.utc)
+    if end_time.tzinfo is None:
+        end_time = end_time.replace(tzinfo=timezone.utc)
+    hours_remaining = (end_time - now).total_seconds() / 3600.0
+    if hours_remaining <= 0:
+        return 0.0
+    config = {**DEFAULT_TIME_DECAY, **(dict(decay_config or {}))}
+    if hours_remaining >= 24:
+        return float(config["hours_24_plus"])
+    if hours_remaining >= 12:
+        return float(config["hours_12_to_24"])
+    if hours_remaining >= 6:
+        return float(config["hours_6_to_12"])
+    if hours_remaining >= 2:
+        return float(config["hours_2_to_6"])
+    return float(config["hours_under_2"])
 
 
 class ForecastConsensusStrategy(Strategy):
@@ -25,321 +209,283 @@ class ForecastConsensusStrategy(Strategy):
         )
         self._ensemble_cache: dict[tuple[str, date], dict | None] = {}
         self._observation_cache: dict[str, dict | None] = {}
+        self._coord_cache: dict[str, tuple[float, float]] = {}
         self._observations_recorded: set[str] = set()
+        self._geo_source = OpenMeteoSource()
 
     async def generate_decision(self):
-        # Log any pending calibration adjustments
-        # To enable auto-calibration:
-        # 1. Query parameter_adjustments WHERE auto_applied = FALSE
-        # 2. Apply recommended_value to self.strategy_config[parameter_name]
-        # 3. UPDATE parameter_adjustments SET auto_applied = TRUE WHERE id = ?
-        # 4. Only enable when sample_size >= 50 and rolling_brier < 0.20
-        try:
-            with self.db.connect() as conn:
-                pending = list(conn.execute(
-                    "SELECT parameter_name, current_value, recommended_value, reason "
-                    "FROM parameter_adjustments "
-                    "WHERE strategy_id = ? AND auto_applied = 0 "
-                    "ORDER BY created_at DESC",
-                    (self.strategy_id,),
-                ))
-            for adj in pending:
-                logger.warning(
-                    f"Pending calibration adjustment: {adj['parameter_name']} "
-                    f"{adj['current_value']} -> {adj['recommended_value']} ({adj['reason']})"
-                )
-        except Exception:
-            pass  # Table may not exist yet
-
+        self._log_pending_adjustments()
         now = datetime.now(timezone.utc)
-        scope = self.strategy_config.get("scope", {})
-        min_volume = float(scope.get("min_volume_usd", 0.0) or 0.0)
-        min_time_remaining = float(scope.get("min_time_remaining_hours", 0.0) or 0.0)
-        scoped_markets = []
-        for row in self.db.list_markets(category="weather", status="active"):
-            if not self.is_market_eligible(row):
-                continue
-            if float(row["volume_usd"]) < min_volume:
-                continue
-            end_time = datetime.fromisoformat(row["end_time"])
-            if (end_time - now).total_seconds() / 3600 < min_time_remaining:
-                continue
-            scoped_markets.append(row)
-        if not scoped_markets and scope.get("skip_if_no_markets"):
-            payload = {
-                "timestamp": now.isoformat(),
-                "strategy_id": self.strategy_id,
-                "markets_considered": [],
-                "predicted_probability": None,
-                "market_implied_probability": None,
-                "expected_edge_bps": None,
-                "confidence": None,
-                "evidence_items": [],
-                "risk_notes": "Strategy skipped because no weather markets were available.",
-                "exit_plan": "No positions opened.",
-                "thinking": "ALGO-1 skipped its cycle because the scanner found no active weather markets and skip_if_no_markets is enabled.",
-                "web_searches_used": [],
-                "actions": [],
-                "no_action_reason": "No active weather markets available; cycle skipped.",
-            }
+        scoped_markets = [
+            row
+            for row in self.db.list_markets(category="weather", status="active")
+            if self.is_market_eligible(row) and self._has_time_remaining(row, now)
+        ]
+        if not scoped_markets and self.strategy_config.get("scope", {}).get("skip_if_no_markets"):
+            payload = self._build_skip_payload(
+                now,
+                "No active weather markets available; cycle skipped.",
+                "Strategy skipped because no weather markets were available.",
+            )
             return parse_decision_payload(payload, strategy_type="algo")
 
-        candidates = []
-        considered = []
-        for row in scoped_markets:
-            contract = self._parse_weather_contract(row["question"])
-            if not contract:
-                continue
-            # Skip markets that already resolved (past dates), but allow same-day markets
-            if contract.get("dated", True) and contract["forecast_date"] < now.date():
-                continue
-            is_same_day = contract.get("dated", True) and contract["forecast_date"] == now.date()
-            yes_outcome, no_outcome = self._binary_outcomes(json.loads(row["outcomes_json"]))
-            if not yes_outcome or not no_outcome:
-                continue
-            yes_buy_price = self._buy_price(yes_outcome)
-            no_buy_price = self._buy_price(no_outcome)
-            ensemble = (
-                await self._get_ensemble(contract["city"], contract["forecast_date"])
-                if contract.get("dated", True)
-                else None
-            )
-            forecast_high = ensemble["ensemble_high_c"] if ensemble else None
-            ensemble_sigma = ensemble["ensemble_sigma_c"] if ensemble else None
-
-            # Intraday path: if market resolves today, use real-time observations
-            used_intraday = False
-            observations = None
-            if is_same_day and ensemble is not None:
-                observations = await self._get_observations(contract["city"])
-                if observations is not None:
-                    threshold_c = self._contract_threshold_c(contract)
-                    if threshold_c is not None:
-                        predicted_yes = self._compute_intraday_probability(
-                            ensemble, observations, contract, "high"
-                        )
-                        used_intraday = True
-                        logger.info(
-                            f"Using intraday observations for {contract['city']} "
-                            f"(current: {observations['current_temp_c']}C, trending: {observations['trending']})"
-                        )
-                        # Record observation to DB (once per city per cycle)
-                        loc_key = contract["city"].lower()
-                        if loc_key not in self._observations_recorded:
-                            self._record_observation(observations)
-                            self._observations_recorded.add(loc_key)
-
-            if not used_intraday:
-                if forecast_high is None:
-                    yes_implied = yes_buy_price
-                    predicted_yes = min(yes_implied + 0.10, 0.95)
-                else:
-                    predicted_yes = self._estimate_probability(contract, forecast_high, sigma_override=ensemble_sigma)
-                    if is_same_day:
-                        logger.info(
-                            f"Using ensemble forecast for {contract['city']} "
-                            f"(resolves today but no observations available)"
-                        )
-                    else:
-                        days_out = (contract["forecast_date"] - now.date()).days
-                        logger.info(f"Using ensemble forecast for {contract['city']} (resolves in {days_out} days)")
-
-            allow_intraday_extreme = False
-            if used_intraday and observations is not None:
-                threshold_c = self._contract_threshold_c(contract)
-                allow_intraday_extreme = (
-                    contract.get("shape") == "at_or_above"
-                    and threshold_c is not None
-                    and observations["max_temp_so_far_c"] >= threshold_c
-                )
-            predicted_yes = self._apply_probability_safety(predicted_yes, allow_intraday_extreme=allow_intraday_extreme)
-
-            yes_implied = yes_buy_price
-            no_implied = no_buy_price
-            no_probability = 1.0 - predicted_yes
-            yes_edge_bps = self._apply_edge_safety(
-                int((predicted_yes - yes_implied) * 10000),
-                row["market_id"],
-                predicted_yes,
-                yes_implied,
-            )
-            no_edge_bps = self._apply_edge_safety(
-                int((no_probability - no_implied) * 10000),
-                row["market_id"],
-                no_probability,
-                no_implied,
-            )
-            best_side = "BUY_YES" if yes_edge_bps >= no_edge_bps else "BUY_NO"
-            edge_bps = max(yes_edge_bps, no_edge_bps)
-            considered.append(row["market_id"])
-            candidates.append(
-                {
-                    "market": row,
-                    "contract": contract,
-                    "forecast_high_c": forecast_high,
-                    "ensemble": ensemble,
-                    "observations": observations,
-                    "used_intraday": used_intraday,
-                    "predicted_yes": predicted_yes,
-                    "yes_outcome": yes_outcome,
-                    "no_outcome": no_outcome,
-                    "yes_buy_price": yes_buy_price,
-                    "no_buy_price": no_buy_price,
-                    "yes_edge_bps": yes_edge_bps,
-                    "no_edge_bps": no_edge_bps,
-                    "best_side": best_side,
-                    "best_edge_bps": edge_bps,
-                }
-            )
-
-        candidates.sort(key=lambda item: item["best_edge_bps"], reverse=True)
+        ranked = await self.rank_opportunities(scoped_markets, now=now)
+        best_candidate = ranked[0] if ranked else None
+        selected_candidate = None
         actions = []
         evidence = []
         kelly_result = None
         risk_result = None
         min_edge = int(self.strategy_config.get("risk", {}).get("min_edge_bps", 200))
-        if candidates and candidates[0]["best_edge_bps"] >= min_edge:
-            top = candidates[0]
-            outcome = top["yes_outcome"] if top["best_side"] == "BUY_YES" else top["no_outcome"]
-            action_side = "BUY"
-            predicted_prob = top["predicted_yes"] if top["best_side"] == "BUY_YES" else (1.0 - top["predicted_yes"])
-            market_price = top["yes_buy_price"] if top["best_side"] == "BUY_YES" else top["no_buy_price"]
 
-            # Kelly position sizing
-            from arena.risk.kelly import compute_position_size
-            portfolio = self.db.get_portfolio(self.strategy_id)
-            bankroll = portfolio.cash if portfolio else float(self.strategy_config.get("starting_balance", 1000.0))
-            sizing_cfg = self.strategy_config.get("position_sizing", {})
-            kelly_result = compute_position_size(
-                predicted_probability=predicted_prob,
-                market_ask_price=market_price,
-                bankroll=bankroll,
-                kelly_fraction=float(sizing_cfg.get("kelly_fraction", 0.25)),
-                max_position_pct=float(sizing_cfg.get("max_position_pct", self.strategy_config["risk"]["max_position_pct"])),
-                min_position_usd=float(sizing_cfg.get("min_position_usd", 1.0)),
-                max_position_usd=float(sizing_cfg.get("max_position_usd", 25.0)),
-                fee_rate=float(sizing_cfg.get("fee_rate", 0.02)),
-                yes_side_probability=top["predicted_yes"],
-            )
-
-            if kelly_result["action"] != "trade":
-                logger.info(f"Kelly says no trade: {kelly_result['reason']}")
-            else:
-                amount = kelly_result["amount_usd"]
-
-                # Risk manager check
-                from arena.risk.risk_manager import RiskManager
-                risk_cfg = self.strategy_config.get("risk_management", self.strategy_config.get("risk", {}))
-                risk_mgr = RiskManager(self.db, risk_cfg)
-                risk_result = await risk_mgr.check_trade(
+        for candidate in ranked:
+            if candidate["best_edge_bps"] < min_edge:
+                break
+            selected_candidate = candidate
+            evidence = self._build_candidate_evidence(candidate, include_rank_summary=True)
+            if not self.should_execute_trade():
+                logger.info(
+                    "Forecast strategy %s generated signal but trade_enabled=false, recording as research-only",
                     self.strategy_id,
-                    top["market"]["market_id"],
-                    amount,
-                    action_side,
-                    venue=top["market"]["venue"],
                 )
-                logger.info(f"Risk check: {risk_result}")
+                break
 
-                if not risk_result["approved"]:
-                    logger.info(f"Risk manager rejected: {risk_result['reason']}")
-                else:
-                    actions.append(
-                        {
-                            "action_type": action_side,
-                            "market_id": top["market"]["market_id"],
-                            "venue": top["market"]["venue"],
-                            "outcome_id": outcome["outcome_id"],
-                            "outcome_label": outcome["label"],
-                            "amount_usd": amount,
-                            "limit_price": outcome.get("best_ask"),
-                            "reasoning_summary": f"Forecast-consensus edge of {top['best_edge_bps']} bps vs market (Kelly: {kelly_result['kelly_bet_fraction']:.3f}).",
-                        }
-                    )
-            ens = top.get("ensemble")
-            if ens:
-                forecast_detail = (
-                    f"{top['contract']['city']} ensemble forecast: {ens['ensemble_high_c']:.1f}C "
-                    f"\u00b1{ens['ensemble_sigma_c']:.1f}C from {ens['sources_used']} sources "
-                    f"({', '.join(ens['source_names'])}), bias correction {ens['bias_correction_applied_c']:+.1f}C"
+            kelly_result = self._size_candidate(candidate)
+            if kelly_result["action"] != "trade":
+                logger.info("Kelly says no trade for %s: %s", candidate["market"]["market_id"], kelly_result["reason"])
+                continue
+
+            risk_result = await self._risk_check(candidate, float(kelly_result["amount_usd"]))
+            if not risk_result["approved"]:
+                logger.info(
+                    "Risk manager rejected %s: %s",
+                    candidate["market"]["market_id"],
+                    risk_result["reason"],
                 )
-            elif top["forecast_high_c"] is not None:
-                forecast_detail = f"{top['contract']['city']} forecast high={top['forecast_high_c']:.2f}C for {top['contract']['forecast_date']}"
-            else:
-                forecast_detail = f"{top['contract']['city']} used fallback heuristic — live forecast data unavailable"
-            evidence.append({"source": "forecast_ensemble", "content": forecast_detail})
-            # Add intraday observation evidence if used
-            obs = top.get("observations")
-            if top.get("used_intraday") and obs:
-                obs_detail = (
-                    f"INTRADAY: {top['contract']['city']} current {obs['current_temp_c']}C, "
-                    f"high so far {obs['max_temp_so_far_c']}C, trending {obs['trending']}, "
-                    f"{obs['hours_remaining']}h daylight remaining, "
-                    f"{obs['sources_used']} observation sources ({', '.join(obs['source_names'])})"
-                )
-                evidence.append({"source": "station_observations", "content": obs_detail})
+                continue
+
+            actions = [self._build_action(candidate, float(kelly_result["amount_usd"]))]
+            break
+
+        display_candidate = selected_candidate or best_candidate
+        if display_candidate and not evidence:
+            evidence = self._build_candidate_evidence(display_candidate, include_rank_summary=True)
+        if ranked:
             evidence.append(
                 {
-                    "source": "market_data",
+                    "source": "opportunity_ranking",
                     "content": (
-                        f"Predicted YES={top['predicted_yes']:.3f}, buy YES ask={top['yes_buy_price']:.3f}, "
-                        f"buy NO ask={top['no_buy_price']:.3f}"
+                        f"Ranked {len(ranked)} weather opportunities this cycle; "
+                        f"top {min(len(ranked), self._max_opportunities_per_cycle())} retained by liquidity-weighted edge."
                     ),
-                },
+                }
             )
-        best_candidate = candidates[0] if candidates else None
-        best_side_probability = None
-        best_side_market_price = None
-        if best_candidate:
-            if best_candidate["best_side"] == "BUY_YES":
-                best_side_probability = best_candidate["predicted_yes"]
-                best_side_market_price = best_candidate["yes_buy_price"]
-            else:
-                best_side_probability = 1.0 - best_candidate["predicted_yes"]
-                best_side_market_price = best_candidate["no_buy_price"]
 
         payload = {
             "timestamp": now.isoformat(),
             "strategy_id": self.strategy_id,
-            "markets_considered": considered[:15],
-            "predicted_probability": best_side_probability,
-            "market_implied_probability": best_side_market_price,
-            "expected_edge_bps": best_candidate["best_edge_bps"] if best_candidate else None,
-            "confidence": 0.68 if actions else None,
+            "markets_considered": [item["market"]["market_id"] for item in ranked],
+            "predicted_probability": display_candidate["best_side_probability"] if display_candidate else None,
+            "market_implied_probability": display_candidate["best_side_market_price"] if display_candidate else None,
+            "expected_edge_bps": display_candidate["best_edge_bps"] if display_candidate else None,
+            "confidence": 0.74 if actions else (0.61 if display_candidate else None),
             "evidence_items": evidence,
-            "risk_notes": "Weather forecast errors and local microclimate effects can erase the modeled edge.",
-            "exit_plan": "Hold until resolution unless the forecast consensus moves materially against the position.",
-            "thinking": "ALGO-1 parses weather thresholds, estimates outcome probability from forecast highs, and trades the side with the largest forecast-versus-market edge.",
+            "risk_notes": (
+                "Weather edge decays into resolution, and unsupported or illiquid contracts are skipped rather than forced."
+            ),
+            "exit_plan": "Hold until resolution unless the ensemble or intraday observation path moves materially against the trade.",
+            "thinking": (
+                "ALGO-1 parses weather market questions, prices the relevant weather outcome from the ensemble, "
+                "applies liquidity and time-decay gates, ranks opportunities by edge weighted by volume, "
+                "and sizes only the strongest surviving candidate."
+            ),
             "web_searches_used": [],
             "actions": actions,
-            "no_action_reason": None if actions else self._build_no_action_reason(candidates, min_edge, kelly_result, risk_result),
+            "no_action_reason": None
+            if actions
+            else self._build_no_action_reason(ranked, min_edge, kelly_result, risk_result),
         }
         return parse_decision_payload(payload, strategy_type="algo")
 
+    async def rank_opportunities(self, markets: list, now: datetime | None = None) -> list[dict]:
+        now = now or datetime.now(timezone.utc)
+        opportunities = []
+        for row in markets:
+            opportunity = await self._evaluate_market(row, now)
+            if opportunity is None:
+                continue
+            opportunities.append(opportunity)
+        opportunities.sort(key=lambda item: (item["rank_score"], item["best_edge_bps"]), reverse=True)
+        return opportunities[: self._max_opportunities_per_cycle()]
+
+    async def _evaluate_market(self, row, now: datetime) -> dict | None:
+        question = str(row["question"])
+        params = parse_weather_question(question)
+        if params is None:
+            logger.info("Skipping unrecognized weather market question: %s", question)
+            return None
+        if params.metric == "rain":
+            logger.info(
+                "Skipping rain market %s because the ensemble path does not expose precipitation probability yet",
+                row["market_id"],
+            )
+            return None
+
+        volume_usd = float(row["volume_usd"] or 0.0)
+        if volume_usd < self._min_market_volume_usd():
+            logger.info(
+                "Skipping %s for low volume: %.2f < %.2f",
+                row["market_id"],
+                volume_usd,
+                self._min_market_volume_usd(),
+            )
+            return None
+
+        end_time = self._parse_end_time(row["end_time"])
+        if end_time <= now:
+            return None
+        if params.date < now.date():
+            logger.info("Skipping stale weather market %s: %s", row["market_id"], question)
+            return None
+
+        try:
+            outcomes = json.loads(row["outcomes_json"])
+        except json.JSONDecodeError as exc:
+            logger.warning("Skipping weather market %s due to malformed outcomes_json: %s", row["market_id"], exc)
+            return None
+        yes_outcome, no_outcome = self._binary_outcomes(outcomes)
+        if not yes_outcome or not no_outcome:
+            logger.info("Skipping weather market %s because it is missing YES/NO outcomes", row["market_id"])
+            return None
+
+        contract = params.to_contract_dict()
+        ensemble = await self._get_ensemble(params.canonical_city, params.date)
+        if ensemble is None:
+            logger.info("Skipping weather market %s because ensemble data is unavailable", row["market_id"])
+            return None
+
+        observations = None
+        used_intraday = False
+        predicted_yes = None
+        is_same_day = params.date == now.date()
+        market_type = "low" if params.metric == "low" else "high"
+        forecast_value_c = self._forecast_value_for_metric(contract, ensemble)
+        sigma_override = ensemble.get("ensemble_sigma_c")
+
+        if is_same_day:
+            observations = await self._get_observations(params.canonical_city)
+            if observations is not None:
+                predicted_yes = self._compute_intraday_probability(ensemble, observations, contract, market_type=market_type)
+                used_intraday = True
+                location_key = params.canonical_city.lower()
+                if location_key not in self._observations_recorded:
+                    self._record_observation(observations)
+                    self._observations_recorded.add(location_key)
+
+        if predicted_yes is None:
+            if forecast_value_c is None:
+                logger.info("Skipping weather market %s because the ensemble lacks %s forecast data", row["market_id"], params.metric)
+                return None
+            predicted_yes = self._estimate_probability(contract, forecast_value_c, sigma_override=sigma_override)
+
+        allow_intraday_extreme = self._allow_intraday_extreme(contract, observations)
+        predicted_yes = self._apply_probability_safety(predicted_yes, allow_intraday_extreme=allow_intraday_extreme)
+
+        yes_buy_price = self._buy_price(yes_outcome)
+        no_buy_price = self._buy_price(no_outcome)
+        no_probability = 1.0 - predicted_yes
+        raw_yes_edge_bps = self._apply_edge_safety(
+            int(round((predicted_yes - yes_buy_price) * 10000)),
+            row["market_id"],
+            predicted_yes,
+            yes_buy_price,
+        )
+        raw_no_edge_bps = self._apply_edge_safety(
+            int(round((no_probability - no_buy_price) * 10000)),
+            row["market_id"],
+            no_probability,
+            no_buy_price,
+        )
+
+        decay_multiplier = 1.0
+        if self._time_decay_enabled():
+            decay_multiplier = compute_time_decay_multiplier(end_time, now=now, decay_config=self._time_decay_config())
+        yes_edge_bps = int(round(raw_yes_edge_bps * decay_multiplier))
+        no_edge_bps = int(round(raw_no_edge_bps * decay_multiplier))
+        best_side = "BUY_YES" if yes_edge_bps >= no_edge_bps else "BUY_NO"
+        best_edge_bps = max(yes_edge_bps, no_edge_bps)
+        best_side_probability = predicted_yes if best_side == "BUY_YES" else no_probability
+        best_side_market_price = yes_buy_price if best_side == "BUY_YES" else no_buy_price
+        rank_score = best_edge_bps * math.sqrt(max(volume_usd, 1.0))
+
+        return {
+            "market": row,
+            "params": params,
+            "contract": contract,
+            "ensemble": ensemble,
+            "observations": observations,
+            "used_intraday": used_intraday,
+            "predicted_yes": predicted_yes,
+            "yes_outcome": yes_outcome,
+            "no_outcome": no_outcome,
+            "yes_buy_price": yes_buy_price,
+            "no_buy_price": no_buy_price,
+            "raw_yes_edge_bps": raw_yes_edge_bps,
+            "raw_no_edge_bps": raw_no_edge_bps,
+            "yes_edge_bps": yes_edge_bps,
+            "no_edge_bps": no_edge_bps,
+            "best_side": best_side,
+            "best_edge_bps": best_edge_bps,
+            "best_side_probability": best_side_probability,
+            "best_side_market_price": best_side_market_price,
+            "volume_usd": volume_usd,
+            "decay_multiplier": decay_multiplier,
+            "rank_score": rank_score,
+        }
+
     async def _get_ensemble(self, city: str, forecast_date: date) -> dict | None:
-        cache_key = (city.lower(), forecast_date)
+        normalized_city = normalize_weather_city(city)
+        cache_key = (normalized_city.lower(), forecast_date)
         if cache_key in self._ensemble_cache:
             return self._ensemble_cache[cache_key]
-        coords = CITY_COORDS.get(city.lower())
+        coords = await self._resolve_city_coordinates(normalized_city)
         if not coords:
-            logger.warning(f"No coordinates for city: {city}")
+            logger.warning("No coordinates for city: %s", normalized_city)
             self._ensemble_cache[cache_key] = None
             return None
         lat, lon = coords
         try:
-            ensemble = await get_ensemble_forecast(lat, lon, city, forecast_date.isoformat(), db=self.db)
+            ensemble = await get_ensemble_forecast(lat, lon, normalized_city, forecast_date.isoformat(), db=self.db)
             logger.info(
-                f"Ensemble forecast for {city}: {ensemble['ensemble_high_c']:.1f}C "
-                f"\u00b1{ensemble['ensemble_sigma_c']:.1f}C from {ensemble['sources_used']} sources "
-                f"using {ensemble.get('ensemble_method', 'simple_mean')} "
-                f"(sigma mult: {ensemble.get('sigma_multiplier_used', 1.0):.2f}, "
-                f"bias corrections: {ensemble.get('bias_corrections_applied', {})})"
+                "Ensemble forecast for %s: %.1fC +/-%.1fC from %s sources",
+                normalized_city,
+                ensemble["ensemble_high_c"],
+                ensemble["ensemble_sigma_c"],
+                ensemble["sources_used"],
             )
             self._ensemble_cache[cache_key] = ensemble
             return ensemble
-        except WeatherDataUnavailable as e:
-            logger.warning(f"Ensemble unavailable for {city}: {e}")
+        except WeatherDataUnavailable as exc:
+            logger.warning("Ensemble unavailable for %s: %s", normalized_city, exc)
             self._ensemble_cache[cache_key] = None
             return None
+
+    async def _resolve_city_coordinates(self, city: str) -> tuple[float, float] | None:
+        normalized_city = normalize_weather_city(city)
+        cache_key = normalized_city.lower()
+        if cache_key in self._coord_cache:
+            return self._coord_cache[cache_key]
+        direct = CITY_COORDS.get(cache_key)
+        if direct:
+            self._coord_cache[cache_key] = direct
+            return direct
+        try:
+            coords = await self._geo_source._resolve_coords(normalized_city)
+        except Exception as exc:
+            logger.warning("Geocoding failed for %s: %s", normalized_city, exc)
+            return None
+        self._coord_cache[cache_key] = coords
+        return coords
 
     def _binary_outcomes(self, outcomes: list[dict]) -> tuple[dict | None, dict | None]:
         yes = next((item for item in outcomes if str(item.get("label", "")).lower() == "yes"), None)
@@ -360,56 +506,36 @@ class ForecastConsensusStrategy(Strategy):
         return 1.0
 
     def _parse_weather_contract(self, question: str) -> dict | None:
-        city_match = re.search(r"in ([A-Za-z .'-]+?) be", question)
-        simple_hit = re.search(r"Will ([A-Za-z .'-]+?) hit (\d+)\s*([CF])\??", question)
-        if city_match:
-            city = city_match.group(1).strip()
-        elif simple_hit:
-            city = simple_hit.group(1).strip()
-        else:
-            return None
-        date_match = re.search(r"on ([A-Z][a-z]+ \d{1,2})(?:,? (\d{4}))?", question)
-        if date_match:
-            month_day, year_text = date_match.groups()
-            year = int(year_text) if year_text else datetime.now(timezone.utc).year
-            forecast_date = datetime.strptime(f"{month_day} {year}", "%B %d %Y").date()
-            dated = True
-        else:
-            forecast_date = datetime.now(timezone.utc).date()
-            dated = False
-        unit = "f" if "°F" in question else "c"
-        if simple_hit:
-            threshold = float(simple_hit.group(2))
-            unit = simple_hit.group(3).lower()
-            return {"city": city, "forecast_date": forecast_date, "unit": unit, "shape": "at_or_above", "threshold": threshold, "dated": dated}
-        if between := re.search(r"between (\d+)-(\d+)°[CF]", question):
-            lower, upper = float(between.group(1)), float(between.group(2))
-            return {"city": city, "forecast_date": forecast_date, "unit": unit, "shape": "between", "lower": lower, "upper": upper, "dated": dated}
-        if higher := re.search(r"(\d+)°[CF] or higher", question):
-            threshold = float(higher.group(1))
-            return {"city": city, "forecast_date": forecast_date, "unit": unit, "shape": "at_or_above", "threshold": threshold, "dated": dated}
-        if lower := re.search(r"(\d+)°[CF] or below", question):
-            threshold = float(lower.group(1))
-            return {"city": city, "forecast_date": forecast_date, "unit": unit, "shape": "at_or_below", "threshold": threshold, "dated": dated}
-        if exact := re.search(r"be (\d+)°[CF] on", question):
-            threshold = float(exact.group(1))
-            return {"city": city, "forecast_date": forecast_date, "unit": unit, "shape": "exact", "threshold": threshold, "dated": dated}
-        return None
+        params = parse_weather_question(question)
+        return params.to_contract_dict() if params else None
 
-    def _estimate_probability(self, contract: dict, forecast_high_c: float, sigma_override: float | None = None) -> float:
-        mean = forecast_high_c if contract["unit"] == "c" else (forecast_high_c * 9 / 5) + 32
-        if sigma_override is not None:
-            sigma = sigma_override if contract["unit"] == "c" else sigma_override * 1.8
-        else:
-            sigma = 2.0 if contract["unit"] == "c" else 3.5
+    def _estimate_probability(self, contract: dict, forecast_value_c: float, sigma_override: float | None = None) -> float:
+        if contract.get("shape") == "rain":
+            return 0.5
+        mean = forecast_value_c if contract["unit"] == "c" else (forecast_value_c * 9 / 5) + 32
+        sigma = (sigma_override or 2.0) if contract["unit"] == "c" else (sigma_override or 2.0) * 1.8
         if contract["shape"] == "between":
-            return max(0.0, min(1.0, self._cdf(contract["upper"] + 0.5, mean, sigma) - self._cdf(contract["lower"] - 0.5, mean, sigma)))
+            return max(
+                0.0,
+                min(
+                    1.0,
+                    self._cdf(contract["upper"] + 0.5, mean, sigma)
+                    - self._cdf(contract["lower"] - 0.5, mean, sigma),
+                ),
+            )
         if contract["shape"] == "at_or_above":
             return max(0.0, min(1.0, 1.0 - self._cdf(contract["threshold"] - 0.5, mean, sigma)))
         if contract["shape"] == "at_or_below":
             return max(0.0, min(1.0, self._cdf(contract["threshold"] + 0.5, mean, sigma)))
         if contract["shape"] == "exact":
-            return max(0.0, min(1.0, self._cdf(contract["threshold"] + 0.5, mean, sigma) - self._cdf(contract["threshold"] - 0.5, mean, sigma)))
+            return max(
+                0.0,
+                min(
+                    1.0,
+                    self._cdf(contract["threshold"] + 0.5, mean, sigma)
+                    - self._cdf(contract["threshold"] - 0.5, mean, sigma),
+                ),
+            )
         return 0.5
 
     def _compute_intraday_probability(
@@ -419,105 +545,90 @@ class ForecastConsensusStrategy(Strategy):
         contract: dict,
         market_type: str = "high",
     ) -> float:
-        """Compute probability using real-time observations blended with ensemble forecast.
-
-        For "high" markets: will the high temperature exceed threshold_c?
-        For "low" markets: will the low temperature go below threshold_c?
-        """
         threshold_c = self._contract_threshold_c(contract)
-        if threshold_c is None:
-            return 0.5
         shape = contract.get("shape", "at_or_above")
-        current_temp = observations["current_temp_c"]
-        max_so_far = observations["max_temp_so_far_c"]
-        min_so_far = observations["min_temp_so_far_c"]
-        trending = observations["trending"]
-        hours_remaining = observations["hours_remaining"]
+        current_temp = float(observations["current_temp_c"])
+        max_so_far = float(observations["max_temp_so_far_c"])
+        min_so_far = float(observations["min_temp_so_far_c"])
+        trending = str(observations["trending"])
+        hours_remaining = float(observations["hours_remaining"])
+        sigma = float(ensemble_forecast["ensemble_sigma_c"])
 
         if market_type == "high":
-            if shape == "at_or_above" and max_so_far >= threshold_c:
-                return 0.98
-
-            # Very unlikely to jump 2+ degrees in the last hour
-            if hours_remaining <= 1.0 and current_temp < threshold_c - 2.0:
-                return 0.05
-
-            # Blend ensemble forecast with observations
             forecast_high = ensemble_forecast["ensemble_high_c"]
-            sigma = ensemble_forecast["ensemble_sigma_c"]
             remaining_warming = forecast_high - current_temp
-
-            if trending == "cooling" and current_temp < threshold_c:
-                # May have already peaked below threshold
+            if trending == "cooling" and threshold_c is not None and current_temp < threshold_c:
                 adjusted_forecast = current_temp + (remaining_warming * 0.3)
-                # sigma stays as-is (more uncertainty when cooling)
-            elif trending == "warming":
-                # Still warming — tighten sigma (real-time confirms trend)
-                adjusted_forecast = forecast_high
             else:
-                # Stable — use ensemble as-is
                 adjusted_forecast = forecast_high
 
-            if shape == "exact":
-                upper_bound = threshold_c + 0.5
-                lower_bound = threshold_c - 0.5
-                if max_so_far > upper_bound:
-                    return 0.01
-                if hours_remaining <= 1.0 and current_temp < lower_bound - 2.0:
-                    return 0.01
-                return max(
-                    0.0,
-                    min(
-                        1.0,
-                        self._cdf(upper_bound, adjusted_forecast, sigma)
-                        - self._cdf(lower_bound, adjusted_forecast, sigma),
-                    ),
-                )
-
-            if shape == "between":
-                lower = contract.get("lower")
-                upper = contract.get("upper")
-                if lower is None or upper is None:
-                    return 0.5
-                if contract["unit"] == "f":
-                    lower = (lower - 32) * 5 / 9
-                    upper = (upper - 32) * 5 / 9
-                lower_bound = lower - 0.5
-                upper_bound = upper + 0.5
-                if max_so_far > upper_bound:
-                    return 0.01
-                return max(
-                    0.0,
-                    min(
-                        1.0,
-                        self._cdf(upper_bound, adjusted_forecast, sigma)
-                        - self._cdf(lower_bound, adjusted_forecast, sigma),
-                    ),
-                )
-
-            return max(0.0, min(1.0, 1.0 - self._cdf(threshold_c - 0.5, adjusted_forecast, sigma)))
-
-        else:  # "low" market: will the low go below threshold_c?
-            if min_so_far <= threshold_c:
+            if threshold_c is not None and shape == "at_or_above" and max_so_far >= threshold_c:
                 return 0.98
-
-            if hours_remaining <= 1.0 and current_temp > threshold_c + 2.0:
+            if threshold_c is not None and hours_remaining <= 1.0 and current_temp < threshold_c - 2.0:
                 return 0.05
+            return self._shape_probability_from_bounds(contract, adjusted_forecast, sigma, observed_extreme=max_so_far)
 
-            forecast_low = ensemble_forecast.get("ensemble_low_c")
-            if forecast_low is None:
-                return 0.5
-            sigma = ensemble_forecast["ensemble_sigma_c"]
-            remaining_cooling = current_temp - forecast_low
+        forecast_low = ensemble_forecast.get("ensemble_low_c")
+        if forecast_low is None:
+            return 0.5
+        remaining_cooling = current_temp - forecast_low
+        if trending == "warming" and threshold_c is not None and current_temp > threshold_c:
+            adjusted_forecast = current_temp - (remaining_cooling * 0.3)
+        else:
+            adjusted_forecast = forecast_low
 
-            if trending == "warming" and current_temp > threshold_c:
-                adjusted_forecast = current_temp - (remaining_cooling * 0.3)
-            elif trending == "cooling":
-                adjusted_forecast = forecast_low
-            else:
-                adjusted_forecast = forecast_low
+        if threshold_c is not None and shape == "at_or_below" and min_so_far <= threshold_c:
+            return 0.98
+        if threshold_c is not None and shape == "at_or_above" and min_so_far < threshold_c:
+            return 0.01
+        if threshold_c is not None and hours_remaining <= 1.0 and current_temp > threshold_c + 2.0 and shape == "at_or_below":
+            return 0.05
+        return self._shape_probability_from_bounds(contract, adjusted_forecast, sigma, observed_extreme=min_so_far, low_market=True)
 
-            return max(0.0, min(1.0, self._cdf(threshold_c + 0.5, adjusted_forecast, sigma)))
+    def _shape_probability_from_bounds(
+        self,
+        contract: dict,
+        mean_c: float,
+        sigma_c: float,
+        observed_extreme: float | None = None,
+        low_market: bool = False,
+    ) -> float:
+        contract_local = dict(contract)
+        if contract_local.get("unit") == "f":
+            mean = (mean_c * 9 / 5) + 32
+            sigma = sigma_c * 1.8
+            observed = (observed_extreme * 9 / 5) + 32 if observed_extreme is not None else None
+        else:
+            mean = mean_c
+            sigma = sigma_c
+            observed = observed_extreme
+
+        shape = contract_local.get("shape")
+        threshold = contract_local.get("threshold")
+        lower = contract_local.get("lower")
+        upper = contract_local.get("upper")
+
+        if shape == "exact" and threshold is not None:
+            if observed is not None:
+                if not low_market and observed > threshold + 0.5:
+                    return 0.01
+                if low_market and observed < threshold - 0.5:
+                    return 0.01
+            return max(0.0, min(1.0, self._cdf(threshold + 0.5, mean, sigma) - self._cdf(threshold - 0.5, mean, sigma)))
+
+        if shape == "between" and lower is not None and upper is not None:
+            if observed is not None:
+                if not low_market and observed > upper + 0.5:
+                    return 0.01
+                if low_market and observed < lower - 0.5:
+                    return 0.01
+            return max(0.0, min(1.0, self._cdf(upper + 0.5, mean, sigma) - self._cdf(lower - 0.5, mean, sigma)))
+
+        if shape == "at_or_above" and threshold is not None:
+            return max(0.0, min(1.0, 1.0 - self._cdf(threshold - 0.5, mean, sigma)))
+        if shape == "at_or_below" and threshold is not None:
+            return max(0.0, min(1.0, self._cdf(threshold + 0.5, mean, sigma)))
+        return 0.5
 
     def _apply_probability_safety(self, probability: float, allow_intraday_extreme: bool = False) -> float:
         upper = 0.98 if allow_intraday_extreme else 0.95
@@ -526,38 +637,39 @@ class ForecastConsensusStrategy(Strategy):
     def _apply_edge_safety(self, edge_bps: int, market_id: str, probability: float, market_price: float) -> int:
         if edge_bps > 5000:
             logger.error(
-                f"SUSPICIOUS: edge {edge_bps} bps for market {market_id} — "
-                f"probability {probability:.4f}, market_price {market_price:.4f} — likely calculation error"
+                "SUSPICIOUS edge %s bps for market %s (probability %.4f vs price %.4f)",
+                edge_bps,
+                market_id,
+                probability,
+                market_price,
             )
         if edge_bps > 3000:
-            logger.warning(f"Edge estimate {edge_bps} bps exceeds safety cap — clamping to 3000")
+            logger.warning("Edge estimate %s bps exceeds safety cap for %s; clamping to 3000", edge_bps, market_id)
             return 3000
         return edge_bps
 
     async def _get_observations(self, city: str) -> dict | None:
-        """Fetch real-time observations for a city, with caching."""
-        cache_key = city.lower()
+        normalized_city = normalize_weather_city(city)
+        cache_key = normalized_city.lower()
         if cache_key in self._observation_cache:
             return self._observation_cache[cache_key]
-        coords = CITY_COORDS.get(cache_key)
+        coords = await self._resolve_city_coordinates(normalized_city)
         if not coords:
             self._observation_cache[cache_key] = None
             return None
         lat, lon = coords
         try:
-            obs = await get_current_observations(lat, lon, city)
-            self._observation_cache[cache_key] = obs
-            return obs
-        except ObservationUnavailable as e:
-            logger.warning(f"Observations unavailable for {city}: {e}")
+            observations = await get_current_observations(lat, lon, normalized_city)
+            self._observation_cache[cache_key] = observations
+            return observations
+        except ObservationUnavailable as exc:
+            logger.warning("Observations unavailable for %s: %s", normalized_city, exc)
             self._observation_cache[cache_key] = None
             return None
 
     def _contract_threshold_c(self, contract: dict) -> float | None:
-        """Extract the threshold in Celsius from a parsed contract."""
         threshold = contract.get("threshold")
         if threshold is None:
-            # For between contracts, use the midpoint as a rough threshold
             lower = contract.get("lower")
             upper = contract.get("upper")
             if lower is not None and upper is not None:
@@ -569,36 +681,220 @@ class ForecastConsensusStrategy(Strategy):
         return threshold
 
     def _record_observation(self, observations: dict) -> None:
-        """Persist observation to DB for historical analysis."""
         try:
             with self.db.connect() as conn:
                 conn.execute(
                     "INSERT INTO station_observations (location, source, observation_time, temperature_c, trending) "
                     "VALUES (?, ?, ?, ?, ?)",
                     (
-                        observations["location"].lower(),
+                        str(observations["location"]).lower(),
                         ",".join(observations["source_names"]),
                         observations["observation_time"],
                         observations["current_temp_c"],
                         observations["trending"],
                     ),
                 )
-        except Exception as e:
-            logger.warning(f"Failed to record observation: {e}")
+        except Exception as exc:
+            logger.warning("Failed to record observation: %s", exc)
 
     def _build_no_action_reason(self, candidates, min_edge, kelly_result, risk_result) -> str:
         if not candidates:
-            return "No weather market exceeded the minimum forecast edge threshold."
+            return "No supported weather markets passed parsing, ensemble, liquidity, and timing gates."
         if candidates[0]["best_edge_bps"] < min_edge:
-            return f"Best edge {candidates[0]['best_edge_bps']} bps below minimum {min_edge} bps."
+            return f"Best decayed edge {candidates[0]['best_edge_bps']} bps below minimum {min_edge} bps."
+        if not self.should_execute_trade():
+            return "Trade execution disabled for this strategy; signal recorded as research-only."
         if kelly_result and kelly_result["action"] != "trade":
             return f"Kelly sizing rejected: {kelly_result['reason']}"
         if risk_result and not risk_result["approved"]:
             return f"Risk check rejected: {risk_result['reason']}"
-        return "No weather market exceeded the minimum forecast edge threshold."
+        return "No ranked weather opportunity survived the post-ranking trade gates."
 
     def _cdf(self, x: float, mean: float, sigma: float) -> float:
         if sigma <= 0:
             return 1.0 if x >= mean else 0.0
         z = (x - mean) / (sigma * math.sqrt(2))
         return 0.5 * (1 + math.erf(z))
+
+    def _log_pending_adjustments(self) -> None:
+        try:
+            with self.db.connect() as conn:
+                pending = list(
+                    conn.execute(
+                        "SELECT parameter_name, current_value, recommended_value, reason "
+                        "FROM parameter_adjustments "
+                        "WHERE strategy_id = ? AND auto_applied = 0 "
+                        "ORDER BY created_at DESC",
+                        (self.strategy_id,),
+                    )
+                )
+        except Exception:
+            return
+        for adjustment in pending:
+            logger.warning(
+                "Pending calibration adjustment: %s %s -> %s (%s)",
+                adjustment["parameter_name"],
+                adjustment["current_value"],
+                adjustment["recommended_value"],
+                adjustment["reason"],
+            )
+
+    def _has_time_remaining(self, row, now: datetime) -> bool:
+        end_time = self._parse_end_time(row["end_time"])
+        min_time_remaining = float(self.strategy_config.get("scope", {}).get("min_time_remaining_hours", 0.0) or 0.0)
+        return ((end_time - now).total_seconds() / 3600.0) >= min_time_remaining
+
+    def _parse_end_time(self, value: str) -> datetime:
+        end_time = datetime.fromisoformat(str(value))
+        if end_time.tzinfo is None:
+            end_time = end_time.replace(tzinfo=timezone.utc)
+        return end_time
+
+    def _min_market_volume_usd(self) -> float:
+        return float(self.strategy_config.get("min_market_volume_usd", 500.0) or 500.0)
+
+    def _max_opportunities_per_cycle(self) -> int:
+        return int(self.strategy_config.get("max_opportunities_per_cycle", 5) or 5)
+
+    def _time_decay_enabled(self) -> bool:
+        return bool(self.strategy_config.get("time_decay_enabled", True))
+
+    def _time_decay_config(self) -> dict[str, float]:
+        raw = self.strategy_config.get("time_decay", {}) or {}
+        return {
+            key: float(raw.get(key, default))
+            for key, default in DEFAULT_TIME_DECAY.items()
+        }
+
+    def _forecast_value_for_metric(self, contract: dict, ensemble: dict) -> float | None:
+        if contract.get("metric") == "low":
+            low_value = ensemble.get("ensemble_low_c")
+            return float(low_value) if low_value is not None else None
+        high_value = ensemble.get("ensemble_high_c")
+        return float(high_value) if high_value is not None else None
+
+    def _allow_intraday_extreme(self, contract: dict, observations: dict | None) -> bool:
+        if not observations:
+            return False
+        threshold_c = self._contract_threshold_c(contract)
+        if threshold_c is None:
+            return False
+        if contract.get("metric") == "low":
+            return contract.get("shape") == "at_or_below" and float(observations["min_temp_so_far_c"]) <= threshold_c
+        return contract.get("shape") == "at_or_above" and float(observations["max_temp_so_far_c"]) >= threshold_c
+
+    def _size_candidate(self, candidate: dict) -> dict:
+        from arena.risk.kelly import compute_position_size
+
+        portfolio = self.db.get_portfolio(self.strategy_id)
+        bankroll = portfolio.cash if portfolio else float(self.strategy_config.get("starting_balance", 1000.0))
+        sizing_cfg = self.strategy_config.get("position_sizing", {})
+        return compute_position_size(
+            predicted_probability=float(candidate["best_side_probability"]),
+            market_ask_price=float(candidate["best_side_market_price"]),
+            bankroll=bankroll,
+            kelly_fraction=float(sizing_cfg.get("kelly_fraction", 0.25)),
+            max_position_pct=float(
+                sizing_cfg.get("max_position_pct", self.strategy_config.get("risk", {}).get("max_position_pct", 0.15))
+            ),
+            min_position_usd=float(sizing_cfg.get("min_position_usd", 1.0)),
+            max_position_usd=float(sizing_cfg.get("max_position_usd", 25.0)),
+            fee_rate=float(sizing_cfg.get("fee_rate", 0.02)),
+            yes_side_probability=float(candidate["predicted_yes"]),
+        )
+
+    async def _risk_check(self, candidate: dict, amount_usd: float) -> dict:
+        from arena.risk.risk_manager import RiskManager
+
+        risk_cfg = self.strategy_config.get("risk_management", self.strategy_config.get("risk", {}))
+        risk_mgr = RiskManager(self.db, risk_cfg)
+        return await risk_mgr.check_trade(
+            self.strategy_id,
+            candidate["market"]["market_id"],
+            amount_usd,
+            "BUY",
+            venue=candidate["market"]["venue"],
+        )
+
+    def _build_action(self, candidate: dict, amount_usd: float) -> dict:
+        outcome = candidate["yes_outcome"] if candidate["best_side"] == "BUY_YES" else candidate["no_outcome"]
+        return {
+            "action_type": "BUY",
+            "market_id": candidate["market"]["market_id"],
+            "venue": candidate["market"]["venue"],
+            "outcome_id": outcome["outcome_id"],
+            "outcome_label": outcome["label"],
+            "amount_usd": amount_usd,
+            "limit_price": outcome.get("best_ask"),
+            "reasoning_summary": (
+                f"Weather ensemble edge {candidate['best_edge_bps']} bps after time decay "
+                f"({candidate['decay_multiplier']:.2f}x) and liquidity weighting."
+            ),
+        }
+
+    def _build_candidate_evidence(self, candidate: dict, include_rank_summary: bool = False) -> list[dict]:
+        params = candidate["params"]
+        ensemble = candidate["ensemble"]
+        evidence = [
+            {
+                "source": "forecast_ensemble",
+                "content": (
+                    f"{params.canonical_city} {params.metric} ensemble: "
+                    f"high={ensemble.get('ensemble_high_c')}C low={ensemble.get('ensemble_low_c')}C "
+                    f"sigma={ensemble.get('ensemble_sigma_c')}C from {ensemble.get('sources_used')} sources."
+                ),
+            },
+            {
+                "source": "market_pricing",
+                "content": (
+                    f"YES ask={candidate['yes_buy_price']:.3f}, NO ask={candidate['no_buy_price']:.3f}, "
+                    f"predicted YES={candidate['predicted_yes']:.3f}, decayed edge={candidate['best_edge_bps']} bps, "
+                    f"volume=${candidate['volume_usd']:.0f}."
+                ),
+            },
+            {
+                "source": "time_decay",
+                "content": (
+                    f"Resolution-aware edge multiplier for {candidate['market']['market_id']} = "
+                    f"{candidate['decay_multiplier']:.2f}x."
+                ),
+            },
+        ]
+        observations = candidate.get("observations")
+        if candidate.get("used_intraday") and observations:
+            evidence.append(
+                {
+                    "source": "station_observations",
+                    "content": (
+                        f"Intraday path: current={observations['current_temp_c']}C, "
+                        f"max={observations['max_temp_so_far_c']}C, min={observations['min_temp_so_far_c']}C, "
+                        f"trend={observations['trending']}."
+                    ),
+                }
+            )
+        if include_rank_summary:
+            evidence.append(
+                {
+                    "source": "opportunity_score",
+                    "content": f"Rank score=edge_bps*sqrt(volume)={candidate['rank_score']:.2f}.",
+                }
+            )
+        return evidence
+
+    def _build_skip_payload(self, now: datetime, no_action_reason: str, risk_notes: str) -> dict:
+        return {
+            "timestamp": now.isoformat(),
+            "strategy_id": self.strategy_id,
+            "markets_considered": [],
+            "predicted_probability": None,
+            "market_implied_probability": None,
+            "expected_edge_bps": None,
+            "confidence": None,
+            "evidence_items": [],
+            "risk_notes": risk_notes,
+            "exit_plan": "No positions opened.",
+            "thinking": "ALGO-1 skipped its cycle because no eligible weather markets were available.",
+            "web_searches_used": [],
+            "actions": [],
+            "no_action_reason": no_action_reason,
+        }

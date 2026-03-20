@@ -218,6 +218,24 @@ class LLMStrategy(Strategy):
                     },
                     strategy_id=self.strategy_id,
                 )
+            if parsed.get("actions") and not self.should_execute_trade():
+                logger.info(
+                    "LLM strategy %s generated signal but trade_enabled=false, recording as research-only",
+                    self.strategy_id,
+                )
+                self.db.record_event(
+                    "llm_signal_research_only",
+                    {
+                        "strategy_id": self.strategy_id,
+                        "actions_blocked": len(parsed.get("actions", [])),
+                        "predicted_probability": parsed.get("predicted_probability"),
+                        "market_implied_probability": parsed.get("market_implied_probability"),
+                        "expected_edge_bps": parsed.get("expected_edge_bps"),
+                    },
+                    strategy_id=self.strategy_id,
+                )
+                parsed["no_action_reason"] = "Research-only mode: trade_enabled=false"
+                parsed["actions"] = []
             self.db.record_event(
                 "llm_response_served",
                 {

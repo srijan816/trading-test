@@ -2,7 +2,7 @@
 id = "algo_harvester"
 name = "Late-Stage Harvester"
 type = "algo"
-enabled = true
+enabled = false
 starting_balance = 10000.0
 
 [strategy.schedule]

@@ -6,11 +6,12 @@ from arena.db import ArenaDB
 from arena.models import Decision
 
 
-class Strategy(ABC):
+class BaseStrategy(ABC):
     def __init__(self, db: ArenaDB, strategy_config: dict) -> None:
         self.db = db
         self.strategy_config = strategy_config
         self.strategy_id = strategy_config["id"]
+        self.trade_enabled = bool(strategy_config.get("trade_enabled", True))
         scope = strategy_config.get("scope", {})
         self.supported_formats: list[str] = (
             scope.get("supported_formats")
@@ -30,6 +31,13 @@ class Strategy(ABC):
                 return False
         return True
 
+    def should_execute_trade(self) -> bool:
+        return self.trade_enabled
+
     @abstractmethod
     async def generate_decision(self) -> Decision:
         raise NotImplementedError
+
+
+class Strategy(BaseStrategy):
+    pass

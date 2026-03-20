@@ -1,0 +1,112 @@
+<div id="execution-funnel-page"
+     class="page"
+     hx-get="/api/execution-funnel"
+     hx-trigger="every 30s"
+     hx-include="#execution-funnel-filters"
+     hx-swap="outerHTML">
+  <section class="card">
+    <div class="card-header">
+      <div>
+        <div class="section-title">Execution Gate Funnel</div>
+        <div class="muted">Tracks where candidate trades die before reaching the market.</div>
+      </div>
+      <form id="execution-funnel-filters"
+            class="filters"
+            hx-get="/api/execution-funnel"
+            hx-target="#execution-funnel-page"
+            hx-swap="outerHTML">
+        <label>
+          <span>Strategy</span>
+          <select name="strategy">
+            <option value="all" {% if content.selected_strategy == "all" %}selected{% endif %}>all</option>
+            {% for strategy in content.strategies %}
+            <option value="{{ strategy }}" {% if strategy == content.selected_strategy %}selected{% endif %}>{{ strategy }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          <span>Window</span>
+          <select name="hours">
+            {% for value, label in [(6, "6h"), (24, "24h"), (72, "72h")] %}
+            <option value="{{ value }}" {% if value == content.hours %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      </form>
+    </div>
+
+    {% if content.structured_available and content.steps %}
+    <div class="funnel-list funnel-list-large">
+      {% for step in content.steps %}
+      <div class="funnel-row">
+        <div class="funnel-label">{{ step.label }}</div>
+        <div class="funnel-track">
+          <div class="funnel-bar" style="width: {{ ((step.percent_of_top or 0) * 100)|round(1) }}%"></div>
+        </div>
+        <div class="funnel-value mono">{{ step.count }}</div>
+        <div class="funnel-pct mono">{% if step.percent_of_top is not none %}{{ step.percent_of_top|pct }}{% else %}-{% endif %}</div>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state">Structured `execution_gate_*` rows are not available yet. This page is ready, but the funnel is currently showing legacy skip context only.</div>
+    <div class="metric-grid">
+      <div><div class="metric-label">Trade Intents</div><div class="metric-value mono">{{ content.legacy_summary.trade_intents }}</div></div>
+      <div><div class="metric-label">Execution Skips</div><div class="metric-value mono">{{ content.legacy_summary.execution_skips }}</div></div>
+      <div><div class="metric-label">Trades Executed</div><div class="metric-value mono">{{ content.legacy_summary.trades_executed }}</div></div>
+    </div>
+    {% endif %}
+  </section>
+
+  {% if content.per_strategy and content.selected_strategy == "all" %}
+  <section class="card">
+    <div class="section-title">Per-Strategy Funnel</div>
+    <div class="grid-cards grid-cards-three">
+      {% for strategy, steps in content.per_strategy.items() %}
+      <article class="mini-card">
+        <div class="subsection-title">{{ strategy }}</div>
+        <div class="funnel-list">
+          {% for step in steps %}
+          <div class="funnel-row">
+            <div class="funnel-label">{{ step.label }}</div>
+            <div class="funnel-track">
+              <div class="funnel-bar" style="width: {{ ((step.percent_of_top or 0) * 100)|round(1) }}%"></div>
+            </div>
+            <div class="funnel-value mono">{{ step.count }}</div>
+          </div>
+          {% endfor %}
+        </div>
+      </article>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
+  <section class="card">
+    <div class="section-title">Top Rejection Reasons</div>
+    {% if content.rejection_reasons %}
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Reason</th>
+          <th class="num">Count</th>
+          <th class="num">% of Rejections</th>
+          <th>Example Market</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in content.rejection_reasons %}
+        <tr>
+          <td>{{ row.reason }}</td>
+          <td class="num mono">{{ row.count }}</td>
+          <td class="num mono">{% if row.percent is not none %}{{ row.percent|pct }}{% else %}-{% endif %}</td>
+          <td>{{ row.example_market }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">No execution skip rows were recorded in the selected window.</div>
+    {% endif %}
+  </section>
+</div>

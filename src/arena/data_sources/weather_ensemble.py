@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import math
+import sqlite3
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -270,38 +271,47 @@ async def _fetch_nvidia_fourcastnet(
     )
 
 
-def _load_sigma_adjustment_from_db(db, city: str) -> float | None:
-    """
-    Read the latest ensemble_sigma parameter_adjustment for a city from parameter_adjustments.
-    Returns the recommended_value (a sigma multiplier) or None if no adjustment exists.
-    This closes the CRPS feedback loop so calibration suggestions are applied to forecasts.
-    """
-    if db is None:
+def _resolve_db_path(db_path_or_db) -> Path | None:
+    if db_path_or_db is None:
         return None
+    if isinstance(db_path_or_db, (str, Path)):
+        return Path(db_path_or_db)
+    candidate = getattr(db_path_or_db, "path", None)
+    return Path(candidate) if candidate else None
+
+
+def load_latest_sigma(db_path: str | Path, city: str) -> float | None:
+    """Load and mark the most recent city-specific sigma recommendation."""
+    db_file = Path(db_path)
+    if not db_file.exists():
+        return None
+
+    conn = sqlite3.connect(db_file)
     try:
-        with db.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT recommended_value, reason, created_at
-                FROM parameter_adjustments
-                WHERE parameter_name = 'ensemble_sigma'
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-            ).fetchone()
-        if not row:
+        conn.row_factory = sqlite3.Row
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(parameter_adjustments)").fetchall()}
+        if "city" not in columns:
             return None
-        recommended = float(row["recommended_value"])
-        if recommended <= 0:
+        row = conn.execute(
+            """
+            SELECT id, recommended_value
+            FROM parameter_adjustments
+            WHERE lower(city) = lower(?) AND parameter_name = 'ensemble_sigma'
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (city,),
+        ).fetchone()
+        if row is None:
             return None
-        logger.info(
-            "Loaded sigma adjustment from DB for %s: recommended_sigma=%.2f (reason: %s, at %s)",
-            city, recommended, row["reason"], row["created_at"],
-        )
-        return recommended
-    except Exception as exc:
-        logger.warning("Could not read parameter_adjustments for %s: %s", city, exc)
-        return None
+        adj_id, recommended_sigma = int(row["id"]), float(row["recommended_value"])
+        if recommended_sigma <= 0:
+            return None
+        conn.execute("UPDATE parameter_adjustments SET auto_applied = 1 WHERE id = ?", (adj_id,))
+        conn.commit()
+        return recommended_sigma
+    finally:
+        conn.close()
 
 
 async def get_ensemble_forecast(
@@ -384,13 +394,27 @@ async def get_ensemble_forecast(
             calibration.get("best_sigma_multiplier", 1.10),
         )
     )
-    # Override with DB-sourced sigma adjustment if available (closes CRPS feedback loop)
-    db_sigma_mult = _load_sigma_adjustment_from_db(db, location_name)
-    if db_sigma_mult is not None:
-        sigma_mult = db_sigma_mult
-        logger.info("Sigma multiplier overridden by parameter_adjustments: %.3f", sigma_mult)
     weighted_sigma = 1.0 / math.sqrt(total_weight)
-    final_sigma = max(weighted_sigma * sigma_mult, 0.5)
+    default_sigma = max(weighted_sigma * sigma_mult, 0.5)
+
+    # Priority chain for sigma selection:
+    # 1. Latest city-specific recommendation in parameter_adjustments
+    # 2. sigma_calibration.json / hardcoded calibration multiplier
+    # 3. Raw inverse-variance ensemble spread
+    db_path = _resolve_db_path(db)
+    adjusted_sigma = load_latest_sigma(db_path, location_name) if db_path is not None else None
+    if adjusted_sigma is not None:
+        logger.info(
+            "Using calibrated sigma for %s: %.3fC (from parameter_adjustments)",
+            location_name,
+            adjusted_sigma,
+        )
+        final_sigma = max(float(adjusted_sigma), 0.5)
+        sigma_source = "parameter_adjustments"
+    else:
+        logger.info("Using default sigma for %s: %.3fC", location_name, default_sigma)
+        final_sigma = default_sigma
+        sigma_source = "sigma_calibration.json" if calibration.get("loaded_from") != "hardcoded defaults" else "default"
 
     source_count = len(forecasts)
     if source_count >= 3:
@@ -410,7 +434,8 @@ async def get_ensemble_forecast(
         "ensemble_low_c": round(mean_low, 2) if mean_low is not None else None,
         "ensemble_method": "rmse_weighted",
         "ensemble_sigma_c": round(final_sigma, 2),
-        "sigma_multiplier_used": round(sigma_mult, 3),
+        "sigma_multiplier_used": round(final_sigma / weighted_sigma, 3) if weighted_sigma > 0 else None,
+        "sigma_source": sigma_source,
         "bias_correction_applied_c": 0.0,
         "bias_corrections_applied": {source: round(bias, 3) for source, bias in bias_corrections_applied.items()},
         "source_weights": {source: round(weight, 6) for source, weight in source_weights.items()},

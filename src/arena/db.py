@@ -8,6 +8,8 @@ import json
 import sqlite3
 
 from .event_groups import derive_event_group
+from .engine.order_schema import LIMIT_ORDERS_DDL, ORDER_EVENTS_DDL
+from .intelligence.discovery_logger import DISCOVERY_ALERTS_DDL
 from .models import (
     DailySnapshot,
     Decision,
@@ -232,12 +234,16 @@ class ArenaDB:
     def initialize(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            conn.executescript(LIMIT_ORDERS_DDL)
+            conn.executescript(ORDER_EVENTS_DDL)
+            conn.executescript(DISCOVERY_ALERTS_DDL)
             self._migrate(conn)
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(markets)")}
         position_columns = {row["name"] for row in conn.execute("PRAGMA table_info(positions)")}
         research_log_columns = {row["name"] for row in conn.execute("PRAGMA table_info(research_log)")}
+        parameter_adjustment_columns = {row["name"] for row in conn.execute("PRAGMA table_info(parameter_adjustments)")}
         if "event_group" not in columns:
             conn.execute("ALTER TABLE markets ADD COLUMN event_group TEXT")
         if "secondary_category" not in columns:
@@ -250,6 +256,8 @@ class ArenaDB:
             conn.execute("ALTER TABLE positions ADD COLUMN closed_at TEXT")
         if "reasoning_trace" not in research_log_columns:
             conn.execute("ALTER TABLE research_log ADD COLUMN reasoning_trace TEXT")
+        if "city" not in parameter_adjustment_columns and parameter_adjustment_columns:
+            conn.execute("ALTER TABLE parameter_adjustments ADD COLUMN city TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_markets_event_group ON markets(event_group)")
 
         # Week 1: forecast history for bias tracking
@@ -307,6 +315,7 @@ class ArenaDB:
             CREATE TABLE IF NOT EXISTS parameter_adjustments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 strategy_id TEXT NOT NULL,
+                city TEXT,
                 parameter_name TEXT NOT NULL,
                 current_value REAL NOT NULL,
                 recommended_value REAL NOT NULL,
@@ -314,6 +323,10 @@ class ArenaDB:
                 auto_applied BOOLEAN DEFAULT 0,
                 created_at TEXT DEFAULT (datetime('now'))
             )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_parameter_adjustments_city_param
+            ON parameter_adjustments(city, parameter_name, created_at)
         """)
 
         # Intraday: station observation history
@@ -335,6 +348,7 @@ class ArenaDB:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_research_log_timestamp ON research_log(timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_research_log_strategy_timestamp ON research_log(strategy, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_research_log_market_timestamp ON research_log(market_id, timestamp)")
+        conn.executescript(DISCOVERY_ALERTS_DDL)
         rows = list(
             conn.execute(
                 "SELECT market_id, venue, slug, question, category FROM markets WHERE event_group IS NULL OR event_group = ''"

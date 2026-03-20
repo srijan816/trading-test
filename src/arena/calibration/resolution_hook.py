@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 from arena.adapters.weather_openmeteo import CITY_COORDS
 from arena.calibration.crps_tracker import CRPSTracker
-from arena.data_sources.station_observations import get_daily_observed_temperatures
+from arena.data_sources.station_observations import get_daily_observed_temperature_details
 from arena.db import ArenaDB
 
 logger = logging.getLogger(__name__)
@@ -189,6 +189,139 @@ def _extract_gaussian_inputs(evidence_items: list[dict]) -> tuple[float | None, 
     return mu_c, sigma_c, source_names
 
 
+def _compute_market_probability(parsed_weather: dict[str, object], mu_c: float, sigma_c: float) -> float | None:
+    if sigma_c <= 0:
+        return None
+
+    distribution = statistics.NormalDist(mu=mu_c, sigma=sigma_c)
+    shape = str(parsed_weather.get("shape") or "unknown")
+    threshold_c = parsed_weather.get("threshold_c")
+
+    if shape == "between":
+        lower = parsed_weather.get("lower")
+        upper = parsed_weather.get("upper")
+        unit = str(parsed_weather.get("unit") or "c").lower()
+        if lower is None or upper is None:
+            return None
+        if unit == "f":
+            lower = _f_to_c(float(lower))
+            upper = _f_to_c(float(upper))
+        probability = distribution.cdf(float(upper)) - distribution.cdf(float(lower))
+    elif threshold_c is None:
+        return None
+    elif shape == "at_or_above":
+        probability = 1.0 - distribution.cdf(float(threshold_c))
+    elif shape == "at_or_below":
+        probability = distribution.cdf(float(threshold_c))
+    elif shape == "exact":
+        probability = distribution.cdf(float(threshold_c) + 0.5) - distribution.cdf(float(threshold_c) - 0.5)
+    else:
+        return None
+
+    return max(0.0, min(1.0, float(probability)))
+
+
+def compute_sigma_adjustment(current_sigma: float, crps_ratio: float, n_observations: int) -> float:
+    """Compute a city-level sigma recommendation in degrees Celsius."""
+    sigma = max(float(current_sigma), 0.5)
+    ratio = float(crps_ratio)
+    observations = int(n_observations)
+
+    if observations < 5:
+        adjusted = sigma
+    elif ratio > 5.0:
+        adjusted = sigma * 2.0
+    elif ratio > 2.0:
+        adjusted = sigma * 1.5
+    elif ratio > 1.5:
+        adjusted = sigma * 1.2
+    elif ratio < 0.8:
+        adjusted = sigma * 0.9
+    else:
+        adjusted = sigma
+
+    return round(min(max(adjusted, 0.5), 10.0), 3)
+
+
+def _write_parameter_adjustment(
+    db: ArenaDB,
+    *,
+    strategy_id: str,
+    parameter_name: str,
+    current_value: float,
+    recommended_value: float,
+    reason: str,
+    city: str | None = None,
+) -> int | None:
+    logger.info(
+        "Writing parameter adjustment: city=%s, param=%s, old=%.3f, new=%.3f, reason=%s",
+        city,
+        parameter_name,
+        current_value,
+        recommended_value,
+        reason,
+    )
+    try:
+        with db.connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO parameter_adjustments "
+                "(strategy_id, city, parameter_name, current_value, recommended_value, reason) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (strategy_id, city, parameter_name, current_value, recommended_value, reason),
+            )
+        logger.info("Parameter adjustment written successfully, id=%s", cursor.lastrowid)
+        return int(cursor.lastrowid)
+    except Exception as exc:
+        logger.error("FAILED to write parameter adjustment: %s", exc, exc_info=True)
+        return None
+
+
+def _write_sigma_adjustment_for_city(
+    db: ArenaDB,
+    tracker: CRPSTracker,
+    *,
+    city: str,
+    current_sigma_c: float,
+) -> int | None:
+    summary = tracker.get_calibration_summary(city=city, last_n_days=30)
+    n_records = int(summary.get("n_records", 0) or 0)
+    calibration_ratio = float(summary.get("calibration_ratio", 0.0) or 0.0)
+    recommended_sigma_c = compute_sigma_adjustment(current_sigma_c, calibration_ratio, n_records)
+
+    if n_records < 5 or abs(recommended_sigma_c - float(current_sigma_c)) < 0.01:
+        return None
+
+    latest_row = None
+    with db.connect() as conn:
+        latest_row = conn.execute(
+            """
+            SELECT recommended_value, created_at
+            FROM parameter_adjustments
+            WHERE lower(city) = lower(?) AND parameter_name = 'ensemble_sigma'
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (city,),
+        ).fetchone()
+
+    if latest_row and abs(float(latest_row["recommended_value"]) - recommended_sigma_c) < 0.01:
+        return None
+
+    reason = (
+        f"CRPS calibration ratio {calibration_ratio:.2f}x across {n_records} resolved markets "
+        f"for {city} - recommend sigma {current_sigma_c:.2f}C -> {recommended_sigma_c:.2f}C"
+    )
+    return _write_parameter_adjustment(
+        db,
+        strategy_id="weather_ensemble",
+        city=city,
+        parameter_name="ensemble_sigma",
+        current_value=current_sigma_c,
+        recommended_value=recommended_sigma_c,
+        reason=reason,
+    )
+
+
 def _load_source_forecasts(
     db: ArenaDB,
     location: str | None,
@@ -326,6 +459,13 @@ async def on_market_resolved(
     actual_high = resolution_data.get("actual_high_c")
     actual_low = resolution_data.get("actual_low_c")
     threshold_c = resolution_data.get("threshold_c") or (parsed_weather or {}).get("threshold_c")
+    observation_details: dict[str, object] = {
+        "source": resolution_data.get("observation_source"),
+        "timestamp": resolution_data.get("observation_timestamp"),
+        "secondary_source": resolution_data.get("observation_secondary_source"),
+        "secondary_high_c": resolution_data.get("observation_secondary_high_c"),
+        "disagreement_c": resolution_data.get("observation_disagreement_c"),
+    }
     resolution_data["location"] = location
     resolution_data["target_date"] = target_date
     if threshold_c is not None:
@@ -336,16 +476,30 @@ async def on_market_resolved(
         if coords is None:
             logger.warning("Skipping CRPS lookup for %s: no coordinates for %s", market_id, location)
         else:
-            actual_high, actual_low = await get_daily_observed_temperatures(
+            observed = await get_daily_observed_temperature_details(
                 db,
                 latitude=coords[0],
                 longitude=coords[1],
                 location_name=str(location),
                 target_date=str(target_date),
             )
+            actual_high = observed.get("actual_high_c")
+            actual_low = observed.get("actual_low_c")
             if actual_high is not None:
                 resolution_data["actual_high_c"] = actual_high
                 resolution_data["actual_low_c"] = actual_low
+                resolution_data["observation_source"] = observed.get("observation_source")
+                resolution_data["observation_timestamp"] = observed.get("observation_timestamp")
+                resolution_data["observation_secondary_source"] = observed.get("observation_secondary_source")
+                resolution_data["observation_secondary_high_c"] = observed.get("observation_secondary_high_c")
+                resolution_data["observation_disagreement_c"] = observed.get("observation_disagreement_c")
+                observation_details = {
+                    "source": observed.get("observation_source"),
+                    "timestamp": observed.get("observation_timestamp"),
+                    "secondary_source": observed.get("observation_secondary_source"),
+                    "secondary_high_c": observed.get("observation_secondary_high_c"),
+                    "disagreement_c": observed.get("observation_disagreement_c"),
+                }
             else:
                 logger.warning(
                     "Skipping CRPS for %s: no observed high available for %s on %s",
@@ -416,35 +570,73 @@ async def on_market_resolved(
                 (row["decision_id"], market_id, row["strategy_id"], predicted_prob, actual_outcome, round(brier, 6), forecast_error_c),
             )
 
-        if actual_high is not None:
-            forecast_mu_c, forecast_sigma_c, source_names = _extract_gaussian_inputs(evidence)
-            if (forecast_mu_c is None or forecast_sigma_c is None) and latest_decision_context:
-                forecast_mu_c = latest_decision_context.get("mu_c")
-                forecast_sigma_c = latest_decision_context.get("sigma_c")
-                source_names = latest_decision_context.get("source_names") or source_names
-            if forecast_mu_c is not None and forecast_sigma_c is not None and forecast_sigma_c > 0:
-                city = location or resolution_data.get("location") or "unknown"
-                source_forecasts = _load_source_forecasts(db, city, target_date, source_names)
-                crps_tracker.record(
-                    market_id=market_id,
-                    observation=_c_to_f(float(actual_high)),
-                    mu=_c_to_f(forecast_mu_c),
-                    sigma=_delta_c_to_f(forecast_sigma_c),
-                    city=city,
-                    target_date=target_date or "",
-                    sources=source_forecasts,
-                )
-                city_count = len([entry for entry in crps_tracker.history if entry.get("city") == city])
-                if city_count >= 20 and city_count % 20 == 0:
-                    suggestion = crps_tracker.suggest_sigma_adjustment(city=city)
-                    logger.info(f"Sigma suggestion for {city}: {suggestion}")
-            elif str(market_context.get("category")) == "weather":
-                logger.warning(
-                    "Skipping CRPS for %s: missing Gaussian evidence (mu=%s sigma=%s)",
-                    market_id,
-                    forecast_mu_c,
-                    forecast_sigma_c,
-                )
+    if actual_high is not None and latest_decision_context:
+        forecast_mu_c = latest_decision_context.get("mu_c")
+        forecast_sigma_c = latest_decision_context.get("sigma_c")
+        source_names = latest_decision_context.get("source_names") or []
+
+        if forecast_mu_c is not None and forecast_sigma_c is not None and forecast_sigma_c > 0:
+            city = str(location or resolution_data.get("location") or "unknown")
+            source_forecasts = _load_source_forecasts(db, city, target_date, source_names)
+            crps_tracker.record(
+                market_id=market_id,
+                observation=_c_to_f(float(actual_high)),
+                mu=_c_to_f(float(forecast_mu_c)),
+                sigma=_delta_c_to_f(float(forecast_sigma_c)),
+                city=city,
+                target_date=target_date or "",
+                sources=source_forecasts,
+                observed_high_c=float(actual_high),
+                observation_source=str(observation_details.get("source") or "unknown"),
+                observation_timestamp=str(observation_details.get("timestamp") or ""),
+                observation_secondary_source=str(observation_details.get("secondary_source") or ""),
+                observation_secondary_high_c=(
+                    float(observation_details["secondary_high_c"])
+                    if observation_details.get("secondary_high_c") is not None else None
+                ),
+                observation_disagreement_c=(
+                    float(observation_details["disagreement_c"])
+                    if observation_details.get("disagreement_c") is not None else None
+                ),
+            )
+
+            if parsed_weather and actual_market_outcome is not None:
+                forecast_probability = _compute_market_probability(parsed_weather, float(forecast_mu_c), float(forecast_sigma_c))
+                if forecast_probability is not None:
+                    crps_tracker.record_brier(
+                        city=city,
+                        target_date=target_date or "",
+                        market_id=market_id,
+                        question=str(market_context.get("question") or ""),
+                        forecast_prob=forecast_probability,
+                        actual_outcome=float(actual_market_outcome),
+                        observed_high_c=float(actual_high),
+                        observation_source=str(observation_details.get("source") or "unknown"),
+                        observation_timestamp=str(observation_details.get("timestamp") or ""),
+                        observation_secondary_source=str(observation_details.get("secondary_source") or ""),
+                        observation_secondary_high_c=(
+                            float(observation_details["secondary_high_c"])
+                            if observation_details.get("secondary_high_c") is not None else None
+                        ),
+                        observation_disagreement_c=(
+                            float(observation_details["disagreement_c"])
+                            if observation_details.get("disagreement_c") is not None else None
+                        ),
+                    )
+
+            _write_sigma_adjustment_for_city(
+                db,
+                crps_tracker,
+                city=city,
+                current_sigma_c=float(forecast_sigma_c),
+            )
+        elif str(market_context.get("category")) == "weather":
+            logger.warning(
+                "Skipping CRPS for %s: missing Gaussian evidence (mu=%s sigma=%s)",
+                market_id,
+                forecast_mu_c,
+                forecast_sigma_c,
+            )
 
     # C) Compute rolling strategy metrics
     scored_strategies: set[str] = set()
@@ -514,12 +706,6 @@ async def _generate_adjustments(
     if rolling_brier > 0.30:
         adjustments.append(("min_edge_bps", 300, 400, f"Brier score {rolling_brier:.3f} worse than random — raising threshold"))
 
-    if mean_forecast_error_c is not None and mean_forecast_error_c > 0.5:
-        adjustments.append(("ensemble_sigma", 2.0, 2.3, f"Model runs {mean_forecast_error_c:+.1f}C warm — widening uncertainty"))
-
-    if mean_forecast_error_c is not None and mean_forecast_error_c < -0.5:
-        adjustments.append(("ensemble_sigma", 2.0, 2.3, f"Model runs {mean_forecast_error_c:+.1f}C cold — widening uncertainty"))
-
     if overconfidence_rate is not None and overconfidence_rate > 0.4:
         adjustments.append(("max_confidence", 1.0, 0.85, f"Overconfident {overconfidence_rate:.0%} of the time — capping confidence"))
 
@@ -528,18 +714,12 @@ async def _generate_adjustments(
 
     for param_name, current, recommended, reason in adjustments:
         logger.warning(f"CALIBRATION ADJUSTMENT: {param_name} {current} -> {recommended}: {reason}")
-        logger.info(f"Attempting parameter adjustment insert: strategy={strategy_id}, param={param_name}, current={current}, recommended={recommended}")
-        try:
-            with db.connect() as conn:
-                conn.execute(
-                    "INSERT INTO parameter_adjustments "
-                    "(strategy_id, parameter_name, current_value, recommended_value, reason) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (strategy_id, param_name, current, recommended, reason),
-                )
-            logger.info(f"Parameter adjustment inserted successfully for {strategy_id}.{param_name}")
-        except Exception as exc:
-            logger.error(
-                "Parameter adjustment INSERT failed for %s.%s: %s",
-                strategy_id, param_name, exc,
-            )
+        _write_parameter_adjustment(
+            db,
+            strategy_id=strategy_id,
+            parameter_name=param_name,
+            current_value=current,
+            recommended_value=recommended,
+            reason=reason,
+            city=None,
+        )

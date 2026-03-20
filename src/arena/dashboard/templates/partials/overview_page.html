@@ -1,159 +1,191 @@
 <div id="overview-page" class="page page-overview" hx-get="/api/overview" hx-trigger="every 30s" hx-swap="outerHTML">
-  <section class="grid-cards">
-    {% for card in content.portfolio_cards %}
-    <article class="card strategy-card">
-      <div class="card-header">
-        <h3>{{ card.name }}</h3>
-        <span class="muted">{{ card.strategy_id }}</span>
+  <section class="card hero-card">
+    <div class="card-header">
+      <div>
+        <div class="section-title">Trading Overview</div>
+        <div class="muted">Single-screen operating view for weather-focused trading, maker execution readiness, calibration health, and research spend.</div>
       </div>
-      <div class="metric-grid">
-        <div>
-          <div class="metric-label">Cash</div>
-          <div class="metric-value mono">{{ card.cash|money }}</div>
-        </div>
-        <div>
-          <div class="metric-label">Total Value</div>
-          <div class="metric-value mono">{{ card.total_value|money }}</div>
-        </div>
-        <div>
-          <div class="metric-label">Realized P&amp;L</div>
-          <div class="metric-value mono {% if card.realized_pnl > 0 %}positive{% elif card.realized_pnl < 0 %}negative{% endif %}">{{ card.realized_pnl|money }}</div>
-        </div>
-        <div>
-          <div class="metric-label">Unrealized</div>
-          <div class="metric-value mono {% if card.unrealized_pnl > 0 %}positive{% elif card.unrealized_pnl < 0 %}negative{% endif %}">{{ card.unrealized_pnl|money }}</div>
-        </div>
-        <div>
-          <div class="metric-label">Win Rate</div>
-          <div class="metric-value mono">{{ card.win_rate|pct }}</div>
-        </div>
-        <div>
-          <div class="metric-label">Trades</div>
-          <div class="metric-value mono">{{ card.total_trades|intcomma }}</div>
-        </div>
+      <div class="summary-strip">
+        <span>Open positions: <strong class="mono">{{ content.pnl_summary.open_positions }}</strong></span>
+        <span>Discovery: <strong>{{ "active" if content.discovery_stats.active else "not yet active" }}</strong></span>
+        <span>Orders: <strong>{{ "active" if content.order_stats.active else "not yet active" }}</strong></span>
       </div>
-    </article>
-    {% endfor %}
-  </section>
-
-  <section class="card">
-    <div class="section-title">Recent Activity</div>
-    <div class="timeline">
-      {% for item in content.activity %}
-      <div class="timeline-item {{ item.status_class }}">
-        <div class="timeline-time mono" title="{{ item.timestamp|timestamp }}">{{ item.timestamp|relative_time }}</div>
-        <div class="timeline-body">
-          <div class="timeline-headline">
-            {{ item.headline }}
-            {% if item.reset_boundary == "post-reset" %}
-            <span class="badge badge-positive">post-reset</span>
-            {% elif item.reset_boundary == "pre-reset" %}
-            <span class="badge badge-warning">pre-reset</span>
-            {% endif %}
-          </div>
-          <div class="timeline-detail muted">{{ item.detail }}</div>
-        </div>
-      </div>
-      {% endfor %}
     </div>
-  </section>
 
-  <section class="card">
-    <div class="section-title">Research Pipeline Snapshot</div>
-    {% if content.research_summary.latest_reset_at %}
-    <div class="muted">Reset boundary: {{ content.research_summary.latest_reset_at|timestamp }}</div>
-    {% endif %}
     <div class="metric-grid metric-grid-wide">
       <div>
-        <div class="metric-label">Calls (24h)</div>
-        <div class="metric-value mono">{{ content.research_summary.total_calls|intcomma }}</div>
+        <div class="metric-label">Realized P&amp;L</div>
+        <div class="metric-value mono {% if content.pnl_summary.realized_pnl > 0 %}positive{% elif content.pnl_summary.realized_pnl < 0 %}negative{% endif %}">{{ content.pnl_summary.realized_pnl|money }}</div>
       </div>
       <div>
-        <div class="metric-label">Live</div>
-        <div class="metric-value mono">{{ content.research_summary.live_calls|intcomma }}</div>
+        <div class="metric-label">Unrealized P&amp;L</div>
+        <div class="metric-value mono {% if content.pnl_summary.unrealized_pnl > 0 %}positive{% elif content.pnl_summary.unrealized_pnl < 0 %}negative{% endif %}">{{ content.pnl_summary.unrealized_pnl|money }}</div>
       </div>
       <div>
-        <div class="metric-label">Cache Hits</div>
-        <div class="metric-value mono">{{ content.research_summary.cache_hits|intcomma }}</div>
+        <div class="metric-label">Total P&amp;L</div>
+        <div class="metric-value mono {% if content.pnl_summary.total_pnl > 0 %}positive{% elif content.pnl_summary.total_pnl < 0 %}negative{% endif %}">{{ content.pnl_summary.total_pnl|money }}</div>
       </div>
       <div>
-        <div class="metric-label">Errors</div>
-        <div class="metric-value mono">{{ content.research_summary.errors|intcomma }}</div>
+        <div class="metric-label">Today's P&amp;L</div>
+        <div class="metric-value mono {% if content.pnl_summary.today_pnl > 0 %}positive{% elif content.pnl_summary.today_pnl < 0 %}negative{% endif %}">{{ content.pnl_summary.today_pnl|money }}</div>
       </div>
       <div>
-        <div class="metric-label">Used In Decisions</div>
-        <div class="metric-value mono">{{ content.research_summary.used_in_decision|intcomma }}</div>
+        <div class="metric-label">Win Rate</div>
+        <div class="metric-value mono">{% if content.pnl_summary.win_rate is not none %}{{ content.pnl_summary.win_rate|pct }}{% else %}-{% endif %}</div>
       </div>
       <div>
-        <div class="metric-label">Reasoning Traces</div>
-        <div class="metric-value mono">{{ content.research_summary.reasoning_traces|intcomma }}</div>
+        <div class="metric-label">Wins / Losses</div>
+        <div class="metric-value mono">{{ content.pnl_summary.wins }} / {{ content.pnl_summary.losses }}</div>
       </div>
       <div>
-        <div class="metric-label">Avg Duration</div>
-        <div class="metric-value mono">{% if content.research_summary.avg_duration_ms is not none %}{{ content.research_summary.avg_duration_ms|num }} ms{% else %}n/a{% endif %}</div>
-      </div>
-      <div>
-        <div class="metric-label">Last Research</div>
-        <div class="metric-value">{% if content.research_summary.last_research_at %}{{ content.research_summary.last_research_at|relative_time }}{% else %}n/a{% endif %}</div>
+        <div class="metric-label">Research ROI</div>
+        <div class="metric-value mono">{% if content.research_costs.roi is not none %}{{ content.research_costs.roi|num }}x{% else %}-{% endif %}</div>
       </div>
     </div>
+  </section>
+
+  <section class="three-col">
+    <article class="card">
+      <div class="section-title">Execution Funnel (24h)</div>
+      {% if content.execution_funnel.structured_available and content.execution_funnel.steps %}
+      <div class="funnel-list">
+        {% for step in content.execution_funnel.steps %}
+        <div class="funnel-row">
+          <div class="funnel-label">{{ step.label }}</div>
+          <div class="funnel-track">
+            <div class="funnel-bar" style="width: {{ ((step.percent_of_top or 0) * 100)|round(1) }}%"></div>
+          </div>
+          <div class="funnel-value mono">{{ step.count }}</div>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="empty-state">Structured gate events are not present yet. Showing legacy execution summary instead.</div>
+      <div class="metric-grid">
+        <div><div class="metric-label">Trade Intents</div><div class="metric-value mono">{{ content.execution_funnel.legacy_summary.trade_intents }}</div></div>
+        <div><div class="metric-label">Execution Skips</div><div class="metric-value mono">{{ content.execution_funnel.legacy_summary.execution_skips }}</div></div>
+        <div><div class="metric-label">Trades Executed</div><div class="metric-value mono">{{ content.execution_funnel.legacy_summary.trades_executed }}</div></div>
+      </div>
+      {% endif %}
+    </article>
+
+    <article class="card">
+      <div class="section-title">Orders Snapshot</div>
+      {% if content.order_stats.active %}
+      <div class="metric-grid">
+        <div><div class="metric-label">Open Orders</div><div class="metric-value mono">{{ content.order_stats.open_orders }}</div></div>
+        <div><div class="metric-label">Pending Notional</div><div class="metric-value mono">{{ content.order_stats.open_notional|money }}</div></div>
+        <div><div class="metric-label">Fill Rate</div><div class="metric-value mono">{% if content.order_stats.fill_rate is not none %}{{ content.order_stats.fill_rate|pct }}{% else %}-{% endif %}</div></div>
+        <div><div class="metric-label">Avg Fill Time</div><div class="metric-value mono">{{ content.order_stats.avg_time_to_fill_display }}</div></div>
+        <div><div class="metric-label">Avg Slippage</div><div class="metric-value mono">{% if content.order_stats.avg_slippage_cents is not none %}{{ content.order_stats.avg_slippage_cents|num }}c{% else %}-{% endif %}</div></div>
+        <div><div class="metric-label">Cancel / Expire</div><div class="metric-value mono">{% if content.order_stats.cancelled_expired_rate is not none %}{{ content.order_stats.cancelled_expired_rate|pct }}{% else %}-{% endif %}</div></div>
+      </div>
+      {% else %}
+      <div class="empty-state">Limit order system not yet active.</div>
+      {% endif %}
+    </article>
+
+    <article class="card">
+      <div class="section-title">Discovery Snapshot</div>
+      {% if content.discovery_stats.active %}
+      <div class="metric-grid">
+        <div><div class="metric-label">Searches (24h)</div><div class="metric-value mono">{{ content.discovery_stats.searches }}</div></div>
+        <div><div class="metric-label">Signals Found</div><div class="metric-value mono">{{ content.discovery_stats.signals_found }}</div></div>
+        <div><div class="metric-label">Signal Rate</div><div class="metric-value mono">{% if content.discovery_stats.signal_rate is not none %}{{ content.discovery_stats.signal_rate|pct }}{% else %}-{% endif %}</div></div>
+        <div><div class="metric-label">Acted On</div><div class="metric-value mono">{{ content.discovery_stats.acted_on }}</div></div>
+        <div><div class="metric-label">Research Cost</div><div class="metric-value mono">{{ content.discovery_stats.estimated_cost|money }}</div></div>
+        <div><div class="metric-label">Signal ROI</div><div class="metric-value mono">{% if content.discovery_stats.roi is not none %}{{ content.discovery_stats.roi|num }}x{% else %}-{% endif %}</div></div>
+      </div>
+      {% else %}
+      <div class="empty-state">Discovery signal feed not yet active.</div>
+      {% endif %}
+    </article>
+  </section>
+
+  <section class="card">
+    <div class="section-title">Strategy Health Matrix</div>
+    <table class="data-table compact">
+      <thead>
+        <tr>
+          <th>Strategy</th>
+          <th>Status</th>
+          <th>Scope</th>
+          <th>Maker</th>
+          <th class="num">Trades</th>
+          <th class="num">Win Rate</th>
+          <th class="num">Realized</th>
+          <th class="num">Unrealized</th>
+          <th class="num">Sharpe</th>
+          <th class="num">Research Calls</th>
+          <th>Last Trade</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in content.strategy_rows %}
+        <tr>
+          <td>{{ row.strategy_id }}</td>
+          <td><span class="badge badge-{{ row.status_tone }}">{{ row.status_label }}</span></td>
+          <td>{{ "Weather-only" if row.weather_only else "Multi-market / research" }}</td>
+          <td>{{ "Maker-ready" if row.maker_orders else "Taker-only" }}</td>
+          <td class="num mono">{{ row.trades }}</td>
+          <td class="num mono">{% if row.win_rate is not none %}{{ row.win_rate|pct }}{% else %}-{% endif %}</td>
+          <td class="num mono {% if row.realized_pnl > 0 %}positive{% elif row.realized_pnl < 0 %}negative{% endif %}">{{ row.realized_pnl|money }}</td>
+          <td class="num mono {% if row.unrealized_pnl > 0 %}positive{% elif row.unrealized_pnl < 0 %}negative{% endif %}">{{ row.unrealized_pnl|money }}</td>
+          <td class="num mono">{% if row.sharpe is not none %}{{ row.sharpe|num }}{% else %}-{% endif %}</td>
+          <td class="num mono">{{ row.research_calls }}</td>
+          <td>{% if row.last_trade_at %}{{ row.last_trade_at|relative_time }}{% else %}-{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
   </section>
 
   <section class="two-col">
     <article class="card">
-      <div class="section-title">Edge Distribution</div>
-      <table class="data-table">
+      <div class="section-title">City Calibration Snapshot</div>
+      {% if content.calibration_rows %}
+      <table class="data-table compact">
         <thead>
           <tr>
-            <th>Strategy</th>
-            <th>Market</th>
-            <th class="num">Edge</th>
-            <th class="num">Prob</th>
-            <th class="num">Amount</th>
-            <th>Time</th>
+            <th>City</th>
+            <th class="num">Markets</th>
+            <th class="num">CRPS</th>
+            <th class="num">Ratio</th>
+            <th class="num">Brier</th>
+            <th>Tradeable</th>
           </tr>
         </thead>
         <tbody>
-          {% for row in content.edge_rows %}
+          {% for row in content.calibration_rows %}
           <tr>
-            <td>{{ row.strategy_id }}</td>
-            <td title="{{ row.question }}">{{ row.question[:66] }}{% if row.question|length > 66 %}…{% endif %}</td>
-            <td class="num mono {% if row.edge_bps > 500 %}positive{% elif row.edge_bps >= 200 %}warning{% else %}muted{% endif %}">{{ row.edge_bps|bps }}</td>
-            <td class="num mono">{{ row.probability|pct }}</td>
-            <td class="num mono">{{ row.amount_usd|money }}</td>
-            <td title="{{ row.timestamp|timestamp }}">{{ row.timestamp|relative_time }}</td>
+            <td>{{ row.city }}</td>
+            <td class="num mono">{{ row.markets }}</td>
+            <td class="num mono">{{ row.crps|num }}</td>
+            <td class="num mono {% if row.ratio and row.ratio > 5 %}negative{% elif row.ratio and row.ratio > 2 %}warning{% else %}positive{% endif %}">{% if row.ratio is not none %}{{ row.ratio|num }}x{% else %}-{% endif %}</td>
+            <td class="num mono">{% if row.brier is not none %}{{ row.brier|num }}{% else %}-{% endif %}</td>
+            <td>{% if row.tradeable %}<span class="badge badge-positive">tradeable</span>{% else %}<span class="badge badge-negative">{{ row.tradeable_reason }}</span>{% endif %}</td>
           </tr>
           {% endfor %}
         </tbody>
       </table>
+      {% else %}
+      <div class="empty-state">Calibration data not yet available.</div>
+      {% endif %}
     </article>
 
     <article class="card">
-      <div class="section-title">Weather Forecast Monitor</div>
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th>Location</th>
-            <th class="num">Ensemble High</th>
-            <th class="num">± Sigma</th>
-            <th class="num">Sources</th>
-            <th>Trend</th>
-            <th class="num">Last Obs</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for row in content.weather_rows %}
-          <tr>
-            <td title="{{ row.source_names }}">{{ row.location }}</td>
-            <td class="num mono">{{ row.ensemble_high_c|num }}C</td>
-            <td class="num mono">{{ row.sigma_c|num }}C</td>
-            <td class="num mono">{{ row.sources }}</td>
-            <td>{{ row.trend or "n/a" }}</td>
-            <td class="num mono" title="{{ row.obs_time|timestamp if row.obs_time else 'n/a' }}">{{ row.last_obs_c|num }}C</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+      <div class="section-title">Recent Activity</div>
+      <div class="timeline">
+        {% for item in content.activity %}
+        <div class="timeline-item {{ item.status_class }}">
+          <div class="timeline-time mono" title="{{ item.timestamp|timestamp if item.timestamp else 'n/a' }}">{{ item.timestamp|relative_time if item.timestamp else 'n/a' }}</div>
+          <div class="timeline-body">
+            <div class="timeline-headline">{{ item.headline }}</div>
+            <div class="timeline-detail muted">{{ item.detail }}</div>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
     </article>
   </section>
 </div>

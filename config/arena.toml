@@ -42,6 +42,20 @@ responses_dir = "prompts/responses"
 [execution]
 mode = "paper"  # "paper" or "live" — live requires ARENA_LIVE_TRADING env var
 
+[execution.limit_orders]
+enabled = true
+order_ttl_seconds = 300
+reprice_interval_seconds = 45
+tick_size = 0.01
+spread_offset = 0.005
+min_edge_after_fees = 0.01
+stale_after_seconds = 120
+stale_price_delta = 0.02
+random_fill_min_seconds = 5
+random_fill_max_seconds = 60
+allow_partial_fills = true
+auto_replace_expired = false
+
 [risk]
 max_daily_trades = 20
 max_daily_loss_usd = 50.0

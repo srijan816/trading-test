@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, timedelta, timezone
+from enum import Enum
 from typing import Iterable
 import json
 import logging
+import os
 import re
 import time
 
@@ -14,8 +16,10 @@ from arena.calibration.crps_tracker import CRPSTracker
 from arena.data_sources.station_observations import ObservationUnavailable, get_current_observations
 from arena.db import ArenaDB
 from arena.exchanges.kalshi_adapter import KalshiAdapter
+from arena.intelligence.discovery import DiscoveryQueryBuilder, DiscoverySignal, SignalClassifier, SignalType, should_spend_on_research
+from arena.intelligence.discovery_logger import DiscoveryLogger
 from arena.intelligence.rate_limiter import NexusRateLimiter
-from arena.intelligence.research import format_research_for_packet, research_market
+from arena.intelligence.research import format_research_for_packet, research_market, research_topic
 from arena.intelligence.research_cache import ResearchCache
 from arena.models import Market, ResearchBrief, SearchRecord, SearchResult, utc_now
 from arena.strategies.algo_forecast import ForecastConsensusStrategy
@@ -35,6 +39,9 @@ class InfoPacketBuilder:
         self._research_cache: dict[str, dict | None] = {}
         self._kalshi_adapter = KalshiAdapter()
         self._crps_tracker = CRPSTracker()
+        self._discovery_query_builder = DiscoveryQueryBuilder()
+        self._signal_classifier = SignalClassifier()
+        self._discovery_logger = DiscoveryLogger(str(self.db.path))
         self._research_stats = {
             "markets_evaluated": 0,
             "cache_hits": 0,
@@ -104,6 +111,7 @@ class InfoPacketBuilder:
         search_budget = int(strategy_config.get("search", {}).get("max_searches_per_cycle", 0) or 0)
         search_slots_used = 0
         opportunities: list[dict] = []
+        discovery_signals: list[DiscoverySignal] = []
         search_records: list[SearchRecord] = []
         research_briefs: list[ResearchBrief] = []
         research_contexts: list[str] = []
@@ -132,6 +140,9 @@ class InfoPacketBuilder:
                 "end_time": row["end_time"],
                 "time_remaining_hours": round((end_time - utc_now()).total_seconds() / 3600, 2),
                 "outcomes": parsed_outcomes,
+                "discovery_signals": [],
+                "has_breaking_signal": False,
+                "signal_direction": "none",
             }
             if row["category"] == "weather":
                 item["weather_forecasts"] = await self._build_weather_context(row["question"])
@@ -145,22 +156,51 @@ class InfoPacketBuilder:
                     if obs:
                         item["current_conditions"] = obs
             can_research = search_slots_used < search_budget if search_budget > 0 else False
-            nexus_called = False
             if can_research:
-                research_result = await self._maybe_research_market(row, strategy_config)
+                enrichment = await self._maybe_apply_research_modes(
+                    row,
+                    strategy_config,
+                    remaining_budget=search_budget - search_slots_used,
+                )
+                search_slots_used += int(enrichment.get("calls_used", 0) or 0)
+                research_result = enrichment.get("research_context")
                 if research_result:
                     item["research_context"] = research_result
                     research_text = format_research_for_packet(research_result)
                     if research_text:
                         research_contexts.append(research_text)
-                # _maybe_research_market calls _should_search internally, so don't call it again
-                nexus_called = True
+                discovery_result = enrichment.get("discovery_context")
+                if discovery_result:
+                    item["discovery_context"] = discovery_result
+                item["discovery_signals"] = enrichment.get("discovery_signals") or []
+                item["has_breaking_signal"] = bool(
+                    item["discovery_signals"]
+                    and any(signal.signal_type != SignalType.NO_SIGNAL for signal in item["discovery_signals"])
+                )
+                item["signal_direction"] = self._resolve_signal_direction(item["discovery_signals"])
+                discovery_signals.extend(
+                    signal for signal in item["discovery_signals"] if signal.signal_type != SignalType.NO_SIGNAL
+                )
+                discovery_text = self._format_discovery_for_packet(
+                    item["discovery_signals"],
+                    discovery_result,
+                )
+                if discovery_text:
+                    research_contexts.append(discovery_text)
             opportunities.append(item)
-            if can_research and not nexus_called and await self._should_search(row, strategy_config):
-                records, briefs = await self._run_searches(row, strategy_config)
-                search_records.extend(records)
-                research_briefs.extend(briefs)
-                search_slots_used += 1
+            search_cfg = strategy_config.get("search", {})
+            research_mode_raw = str(search_cfg.get("research_mode", "probability") or "probability").strip().lower()
+            if (
+                can_research
+                and research_mode_raw not in {"off", "disabled", "none", "false"}
+                and not search_cfg.get("research_assistant_enabled", search_cfg.get("provider") == "perplexia")
+            ):
+                should_search, _ = await self._should_search(row, strategy_config, call_type="search")
+                if should_search:
+                    records, briefs = await self._run_searches(row, strategy_config)
+                    search_records.extend(records)
+                    research_briefs.extend(briefs)
+                    search_slots_used += 1
         risk_warnings: list[str] = []
         if portfolio:
             if portfolio.peak_value and portfolio.total_value < portfolio.peak_value * 0.85:
@@ -179,6 +219,7 @@ class InfoPacketBuilder:
             "recent_decisions": [self._summarize_recent_decision(row) for row in self.db.list_recent_decisions(strategy_id, limit=5)],
             "risk_warnings": risk_warnings,
             "research_contexts": research_contexts,
+            "discovery_signals": discovery_signals,
             "research_briefs": [asdict(item) for item in research_briefs],
             "web_searches": [asdict(record) for record in search_records],
         }
@@ -204,6 +245,13 @@ class InfoPacketBuilder:
         lines.extend(packet["risk_warnings"] or ["None"])
         lines.extend(["", "## Research Context"])
         lines.extend(packet.get("research_contexts", []) or ["None"])
+        lines.extend(["", "## Discovery Signals"])
+        discovery_items = packet.get("discovery_signals", []) or []
+        if discovery_items:
+            for item in discovery_items:
+                lines.append(self._render_json(item))
+        else:
+            lines.append("None")
         lines.extend(["", "## Research Briefs"])
         for item in packet.get("research_briefs", []):
             lines.append(self._render_json(item))
@@ -234,6 +282,10 @@ class InfoPacketBuilder:
             return obj.isoformat()
         if isinstance(obj, date):
             return obj.isoformat()
+        if isinstance(obj, Enum):
+            return obj.value
+        if is_dataclass(obj):
+            return {k: InfoPacketBuilder._serialize_dates(v) for k, v in asdict(obj).items()}
         if isinstance(obj, dict):
             return {k: InfoPacketBuilder._serialize_dates(v) for k, v in obj.items()}
         if isinstance(obj, (list, tuple)):
@@ -432,7 +484,114 @@ class InfoPacketBuilder:
         }
         return {aliases.get(category, category) for category in categories}
 
-    async def _should_search(self, row, strategy_config: dict) -> tuple[bool, str | None]:
+    def _resolve_research_plan(self, search_cfg: dict) -> list[str]:
+        raw_mode = str(search_cfg.get("research_mode", "probability") or "probability").strip().lower()
+        if raw_mode in {"off", "disabled", "none", "false"}:
+            return []
+        if raw_mode == "discovery":
+            return ["discovery"]
+        if raw_mode == "both":
+            return ["discovery", "probability"]
+        if raw_mode == "probability":
+            return ["probability"]
+        if raw_mode in {"quick", "standard", "deep"}:
+            return ["probability"]
+        return ["probability"]
+
+    def _resolve_probability_depth(self, search_cfg: dict) -> str:
+        raw_mode = str(search_cfg.get("research_mode", "") or "").strip().lower()
+        if raw_mode in {"quick", "standard", "deep"}:
+            return raw_mode
+        return str(search_cfg.get("market_research_depth") or search_cfg.get("mode") or "standard")
+
+    def _resolve_discovery_depth(self, search_cfg: dict) -> str:
+        return str(search_cfg.get("mode") or "standard")
+
+    def _estimated_call_cost(self, search_cfg: dict) -> float:
+        return float(search_cfg.get("estimated_call_cost_usd") or os.getenv("NEXUS_ESTIMATED_CALL_COST_USD", "0.05"))
+
+    def _build_research_cost_context(self, row, strategy_config: dict) -> dict:
+        risk_cfg = strategy_config.get("risk", {})
+        max_position_size = float(
+            risk_cfg.get("max_order_usd")
+            or risk_cfg.get("max_trade_size_usd")
+            or os.getenv("RISK_MAX_SINGLE_TRADE_SIZE", "50")
+        )
+        edge_estimate = float(risk_cfg.get("min_edge_bps", 0) or 0) / 10000.0
+        if edge_estimate <= 0:
+            edge_estimate = 0.02
+        end_time = datetime.fromisoformat(row["end_time"])
+        return {
+            "market_id": str(row["market_id"]),
+            "category": str(row["category"] or ""),
+            "volume_usd": float(row["volume_usd"] or 0.0),
+            "resolution_hours": max(0.0, (end_time - utc_now()).total_seconds() / 3600),
+            "max_position_size": max_position_size,
+            "edge_estimate": edge_estimate,
+            "breaking_news_candidate": str(row["category"] or "").lower() in {"politics", "legal", "geopolitics"},
+        }
+
+    def _resolve_signal_direction(self, signals: list[DiscoverySignal]) -> str:
+        directions = [signal.direction for signal in signals if signal.signal_type != SignalType.NO_SIGNAL and signal.direction]
+        unique = {direction for direction in directions if direction not in {"none", "ambiguous"}}
+        if len(unique) == 1:
+            return next(iter(unique))
+        if len(unique) > 1:
+            return "ambiguous"
+        if any(direction == "ambiguous" for direction in directions):
+            return "ambiguous"
+        return "none"
+
+    def _format_discovery_for_packet(self, signals: list[DiscoverySignal], discovery_result: dict | None) -> str:
+        if not signals:
+            return ""
+        lines = [
+            "=== DISCOVERY CONTEXT ===",
+            "Use this as an alert feed for new information, not as a probability override.",
+        ]
+        if discovery_result:
+            lines.append(f"Query: \"{discovery_result.get('query', 'N/A')}\"")
+            lines.append(f"Mode: {discovery_result.get('mode', 'standard')}")
+        for index, signal in enumerate(signals[:3], 1):
+            lines.append(
+                f"  {index}. [{signal.signal_type.value}] {signal.headline} "
+                f"(direction={signal.direction}, relevance={signal.relevance_score:.2f}, recency_min={signal.recency_minutes})"
+            )
+        return "\n".join(lines)
+
+    async def _maybe_apply_research_modes(self, row, strategy_config: dict, remaining_budget: int) -> dict:
+        search_cfg = strategy_config.get("search", {})
+        plan = self._resolve_research_plan(search_cfg)
+        result = {
+            "research_context": None,
+            "discovery_context": None,
+            "discovery_signals": [],
+            "calls_used": 0,
+        }
+        if remaining_budget <= 0 or not plan:
+            return result
+
+        for call_type in plan:
+            if result["calls_used"] >= remaining_budget:
+                break
+            if call_type == "discovery":
+                discovery_result, used_call = await self._maybe_discover_signals(row, strategy_config)
+                result["calls_used"] += int(used_call)
+                if discovery_result:
+                    result["discovery_context"] = discovery_result.get("discovery_context")
+                    result["discovery_signals"] = discovery_result.get("discovery_signals") or []
+            elif call_type == "probability":
+                research_result, used_call = await self._maybe_research_market(
+                    row,
+                    strategy_config,
+                    research_depth=self._resolve_probability_depth(search_cfg),
+                )
+                result["calls_used"] += int(used_call)
+                if research_result:
+                    result["research_context"] = research_result
+        return result
+
+    async def _should_search(self, row, strategy_config: dict, *, call_type: str = "research") -> tuple[bool, str | None]:
         """Returns (should_search, reason_if_not). Logs research_call_attempted/blocked events."""
         search_cfg = strategy_config.get("search", {})
         strategy_id = str(strategy_config.get("id") or "unknown")
@@ -441,7 +600,7 @@ class InfoPacketBuilder:
         if not search_cfg.get("enabled"):
             self.db.record_event(
                 "research_call_blocked",
-                {"strategy_id": strategy_id, "market_id": market_id, "reason": "search_disabled"},
+                {"strategy_id": strategy_id, "market_id": market_id, "reason": "search_disabled", "call_type": call_type},
             )
             return False, "search_disabled"
 
@@ -455,6 +614,7 @@ class InfoPacketBuilder:
                     "market_id": market_id,
                     "reason": "cooldown",
                     "cooldown_expires_in_seconds": round(expires_in),
+                    "call_type": call_type,
                 },
             )
             return False, "cooldown"
@@ -468,6 +628,7 @@ class InfoPacketBuilder:
                     "market_id": market_id,
                     "reason": "rate_limit",
                     "remaining_calls": nexus_rate_limiter.remaining(),
+                    "call_type": call_type,
                 },
             )
             return False, "rate_limit"
@@ -477,12 +638,21 @@ class InfoPacketBuilder:
         if "always" not in triggers:
             end_time = datetime.fromisoformat(row["end_time"])
             if "near_resolution" not in triggers or end_time > utc_now() + timedelta(hours=24):
+                self.db.record_event(
+                    "research_call_blocked",
+                    {
+                        "strategy_id": strategy_id,
+                        "market_id": market_id,
+                        "reason": "trigger_conditions_not_met",
+                        "call_type": call_type,
+                    },
+                )
                 return False, "trigger_conditions_not_met"
 
         # All gates passed — log the actual attempt
         self.db.record_event(
             "research_call_attempted",
-            {"strategy_id": strategy_id, "market_id": market_id},
+            {"strategy_id": strategy_id, "market_id": market_id, "call_type": call_type},
         )
         return True, None
 
@@ -583,27 +753,175 @@ class InfoPacketBuilder:
             )
         return records, briefs
 
-    async def _maybe_research_market(self, row, strategy_config: dict) -> dict | None:
+    async def _maybe_discover_signals(self, row, strategy_config: dict) -> tuple[dict | None, int]:
         search_cfg = strategy_config.get("search", {})
         strategy_id = str(strategy_config.get("id") or "unknown")
         market_id = str(row["market_id"])
 
         if not search_cfg.get("enabled"):
-            return None
+            return None, 0
         if not search_cfg.get("research_assistant_enabled", search_cfg.get("provider") == "perplexia"):
-            return None
+            return None, 0
+
+        should_search, _ = await self._should_search(row, strategy_config, call_type="discovery")
+        if not should_search:
+            return None, 0
+
+        spend_ok, spend_reason = should_spend_on_research(
+            self._build_research_cost_context(row, strategy_config),
+            estimated_call_cost_usd=self._estimated_call_cost(search_cfg),
+        )
+        if not spend_ok:
+            self.db.record_event(
+                "research_call_blocked",
+                {
+                    "strategy_id": strategy_id,
+                    "market_id": market_id,
+                    "reason": "cost_gate",
+                    "call_type": "discovery",
+                    "detail": spend_reason,
+                },
+            )
+            return None, 0
+
+        cache_key = f"discovery:{market_id}"
+        cached = self._research_cache.get(cache_key)
+        if cached is not None:
+            self._research_stats["cache_hits"] += 1
+            return cached, 0
+
+        market_payload = await self._build_market_research_payload(row, strategy_config)
+        discovery_query = self._discovery_query_builder.build_query(
+            market_id=market_id,
+            question=str(row["question"]),
+            category=str(row["category"] or "event"),
+            ensemble_data=market_payload.get("ensemble_data"),
+            market_data=market_payload.get("market_data"),
+        )
+
+        start_time = time.time()
+        try:
+            result = await research_topic(
+                discovery_query.query_text,
+                mode=self._resolve_discovery_depth(search_cfg),
+                output_length="short",
+                max_sources=discovery_query.max_sources,
+                model=market_payload.get("model"),
+            )
+            nexus_rate_limiter.record_call()
+            self._research_stats["nexus_calls"] += 1
+        except Exception as exc:
+            duration_ms = int((time.time() - start_time) * 1000)
+            nexus_rate_limiter.set_cooldown()
+            self._log_market_research(
+                row=row,
+                strategy_config=strategy_config,
+                market_payload=market_payload,
+                mode="discovery",
+                duration_ms=duration_ms,
+                error=str(exc),
+                query_sent_override=discovery_query.query_text,
+                report_summary_override="Discovery call failed",
+            )
+            self.db.record_event(
+                "research_call_blocked",
+                {
+                    "strategy_id": strategy_id,
+                    "market_id": market_id,
+                    "reason": "nexus_error_triggered_cooldown",
+                    "call_type": "discovery",
+                    "error": str(exc),
+                },
+            )
+            return None, 1
+
+        duration_ms = int((time.time() - start_time) * 1000)
+        report_text = ""
+        sources = []
+        if result:
+            report_text = str(result.get("full_report") or result.get("summary") or "").strip()
+            sources = result.get("sources_detail") or []
+        signals = self._signal_classifier.classify(report_text, sources, str(row["question"]), str(row["category"] or "event"))
+        for signal in signals:
+            signal.market_id = market_id
+
+        if signals and signals[0].signal_type == SignalType.NO_SIGNAL:
+            self._discovery_logger.log_no_signal(
+                market_id=market_id,
+                market_question=str(row["question"]),
+                category=str(row["category"] or "event"),
+                strategy_id=strategy_id,
+            )
+        else:
+            for signal in signals:
+                self._discovery_logger.log_signal(
+                    signal,
+                    strategy_id=strategy_id,
+                    market_question=str(row["question"]),
+                    category=str(row["category"] or "event"),
+                )
+
+        summary = next(
+            (signal.headline for signal in signals if signal.signal_type != SignalType.NO_SIGNAL),
+            "No new signals detected",
+        )
+        self._log_market_research(
+            row=row,
+            strategy_config=strategy_config,
+            market_payload=market_payload,
+            mode="discovery",
+            result=result,
+            duration_ms=duration_ms,
+            from_cache=False,
+            query_sent_override=discovery_query.query_text,
+            report_summary_override=summary,
+        )
+        payload = {
+            "discovery_query": discovery_query,
+            "discovery_context": result,
+            "discovery_signals": signals,
+        }
+        self._research_cache[cache_key] = payload
+        return payload, 1
+
+    async def _maybe_research_market(self, row, strategy_config: dict, *, research_depth: str | None = None) -> tuple[dict | None, int]:
+        search_cfg = strategy_config.get("search", {})
+        strategy_id = str(strategy_config.get("id") or "unknown")
+        market_id = str(row["market_id"])
+
+        if not search_cfg.get("enabled"):
+            return None, 0
+        if not search_cfg.get("research_assistant_enabled", search_cfg.get("provider") == "perplexia"):
+            return None, 0
 
         # Use the new _should_search that returns (should_search, reason)
-        should_search, block_reason = await self._should_search(row, strategy_config)
+        should_search, block_reason = await self._should_search(row, strategy_config, call_type="probability")
         if not should_search:
-            return None
+            return None, 0
+
+        spend_ok, spend_reason = should_spend_on_research(
+            self._build_research_cost_context(row, strategy_config),
+            estimated_call_cost_usd=self._estimated_call_cost(search_cfg),
+        )
+        if not spend_ok:
+            self.db.record_event(
+                "research_call_blocked",
+                {
+                    "strategy_id": strategy_id,
+                    "market_id": market_id,
+                    "reason": "cost_gate",
+                    "call_type": "probability",
+                    "detail": spend_reason,
+                },
+            )
+            return None, 0
 
         market_payload = await self._build_market_research_payload(row, strategy_config)
         if market_id in self._research_cache:
             cached = self._research_cache[market_id]
             if cached is not None:
                 self._research_stats["cache_hits"] += 1
-            return cached
+            return cached, 0
 
         market_type = str(market_payload.get("market_type") or "event")
         market_data = market_payload.get("market_data") or {}
@@ -628,9 +946,9 @@ class InfoPacketBuilder:
                 from_cache=True,
             )
             self._research_cache[market_id] = cached
-            return cached
+            return cached, 0
 
-        requested_mode = str(search_cfg.get("research_mode", "quick"))
+        requested_mode = str(research_depth or self._resolve_probability_depth(search_cfg))
         has_prior_research = research_cache.has_any(market_id)
         mode = self._select_research_mode(market_type, requested_mode, has_prior_research)
 
@@ -675,7 +993,7 @@ class InfoPacketBuilder:
                     },
                 )
             self._research_cache[market_id] = stale
-            return stale
+            return stale, 0
 
         start_time = time.time()
         result = None
@@ -709,6 +1027,7 @@ class InfoPacketBuilder:
                     "strategy_id": strategy_id,
                     "market_id": market_id,
                     "reason": "nexus_error_triggered_cooldown",
+                    "call_type": "probability",
                     "error": str(exc),
                 },
             )
@@ -727,6 +1046,8 @@ class InfoPacketBuilder:
         if result is None:
             # No result and no exception: enter cooldown so next cycle can retry
             nexus_rate_limiter.set_cooldown()
+            self._research_cache[market_id] = None
+            return None, 1
         else:
             self._log_market_research(
                 row=row,
@@ -744,7 +1065,7 @@ class InfoPacketBuilder:
                 ensemble_mu=float(current_ensemble_mu) if current_ensemble_mu is not None else None,
             )
         self._research_cache[market_id] = result
-        return result
+        return result, 1
 
     def _extract_binary_market_prices(self, outcomes: list[dict]) -> tuple[float | None, float | None]:
         yes_price = None
@@ -803,15 +1124,18 @@ class InfoPacketBuilder:
         result: dict | None = None,
         from_cache: bool = False,
         error: str | None = None,
+        query_sent_override: str | None = None,
+        report_summary_override: str | None = None,
     ) -> None:
         strategy_id = str(strategy_config.get("id") or "")
         market_id = str(row["market_id"])
         market_question = str(row["question"])
-        query_sent = (
-            str((result or {}).get("query") or market_question)
-            if result and result.get("fallback_used")
-            else json.dumps(market_payload, ensure_ascii=False, default=str)
-        )
+        if query_sent_override is not None:
+            query_sent = query_sent_override
+        elif result and result.get("fallback_used"):
+            query_sent = str((result or {}).get("query") or market_question)
+        else:
+            query_sent = json.dumps(market_payload, ensure_ascii=False, default=str)
         sources_detail = self._normalize_research_sources(result)
         full_report = self._extract_research_report(result)
         confidence = None
@@ -819,7 +1143,7 @@ class InfoPacketBuilder:
         edge_assessment = None
         reasoning_trace = None
         model_used = None
-        endpoint = "/api/v1/market-research"
+        endpoint = "/api/v1/research" if mode == "discovery" else "/api/v1/market-research"
         resolved_mode = mode
         if result:
             confidence = result.get("confidence_label") or result.get("confidence")
@@ -847,7 +1171,7 @@ class InfoPacketBuilder:
             report_length=len(full_report),
             sources_count=len(sources_detail),
             sources_json=sources_detail,
-            report_summary=full_report[:500] if full_report else None,
+            report_summary=report_summary_override or (full_report[:500] if full_report else None),
             full_report=full_report or None,
             reasoning_trace=str(reasoning_trace).strip() if reasoning_trace else None,
             probability=probability_value,

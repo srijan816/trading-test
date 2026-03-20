@@ -4,6 +4,8 @@ name = "Partition Arbitrage"
 type = "algo"
 enabled = true
 starting_balance = 10000.0
+min_market_volume_usd = 500
+time_decay_enabled = true
 
 [strategy.schedule]
 cadence_minutes = 60
@@ -20,3 +22,10 @@ max_position_pct = 0.10
 max_positions = 12
 max_daily_loss_pct = 0.10
 min_edge_bps = 200
+
+[strategy.time_decay]
+hours_24_plus = 1.0
+hours_12_to_24 = 0.8
+hours_6_to_12 = 0.6
+hours_2_to_6 = 0.4
+hours_under_2 = 0.2

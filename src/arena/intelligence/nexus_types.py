@@ -43,3 +43,22 @@ class MarketResearchResponse:
     ensemble_probability: Optional[float] = None
     llm_probability: Optional[float] = None
     ensemble_override_triggered: bool = False
+
+
+@dataclass
+class NexusResearchRequest:
+    query: str
+    mode: str = "standard"
+    output_length: str = "short"
+    max_sources: int = 3
+    model: str = ""
+    session_id: str = ""
+
+
+@dataclass
+class NexusResearchResponse:
+    report: str = ""
+    sources: List[Dict] = field(default_factory=list)
+    follow_ups: List[str] = field(default_factory=list)
+    session_id: str = ""
+    metadata: Dict = field(default_factory=dict)
