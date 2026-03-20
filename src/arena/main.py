@@ -36,7 +36,7 @@ from arena.export.cli_reports import render_table
 from arena.export.sheets_sync import build_dashboard_payloads
 from arena.env import load_local_env
 from arena.filters.spread_filter import SpreadFilter
-from arena.models import DailySnapshot, Decision, ExecutionResult, Market, ProposedAction, utc_now
+from arena.models import DailySnapshot, Decision, ExecutionResult, Market, OrderBookSnapshot, ProposedAction, utc_now
 from arena.risk.kelly import compute_position_size
 from arena.risk.risk_manager import RiskManager
 from arena.risk.trading_guardrails import FAILURE_STATUSES, maybe_trigger_trading_pause
@@ -376,6 +376,7 @@ async def execute_decision(
             db=db,
             strategy_config={"id": "execution_helper", "starting_balance": 1000.0, "scope": {}, "risk": strategy_cfg.get("risk", {})},
         )
+        orderbook_cache: dict[tuple[str, str, str], OrderBookSnapshot | None] = {}
         for action in decision.actions:
             market_row = db.get_market(action.market_id, action.venue)
 
@@ -514,7 +515,12 @@ async def execute_decision(
             orderbook = None
             orderbook_error = None
             try:
-                orderbook = await adapter.get_orderbook(action.market_id, action.outcome_id)
+                orderbook_key = (str(action.venue), str(action.market_id), str(action.outcome_id))
+                if orderbook_key in orderbook_cache:
+                    orderbook = orderbook_cache[orderbook_key]
+                else:
+                    orderbook = await adapter.get_orderbook(action.market_id, action.outcome_id)
+                    orderbook_cache[orderbook_key] = orderbook
             except Exception as exc:
                 orderbook_error = str(exc)
                 status_code = getattr(getattr(exc, "response", None), "status_code", None)
