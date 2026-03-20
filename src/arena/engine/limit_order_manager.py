@@ -321,13 +321,13 @@ class LimitOrderManager:
         """
         normalized_side = OrderSide.from_value(side)
         tick_size = float(config.get("tick_size", 0.01))
-        spread_offset = float(config.get("spread_offset", 0.005))
         min_edge = float(config.get("min_edge_after_fees", 0.01))
 
-        best_bid, best_ask = self._best_bid_ask(orderbook)
+        best_bid, best_bid_size, best_ask, best_ask_size = self._best_bid_ask_with_size(orderbook)
         if best_bid is None or best_ask is None or best_ask <= best_bid:
             return None
-        if (best_ask - best_bid) <= tick_size:
+        spread = best_ask - best_bid
+        if spread <= tick_size:
             return None
 
         midpoint = (best_bid + best_ask) / 2.0
@@ -336,14 +336,28 @@ class LimitOrderManager:
         if inside_bid > inside_ask:
             return None
 
+        expected_edge = None
+        if model_probability is not None:
+            if normalized_side.is_buy:
+                expected_edge = max(float(model_probability) - midpoint, 0.0)
+            else:
+                expected_edge = max(midpoint - float(model_probability), 0.0)
+
+        # Start 30% into the spread from our side, then become more aggressive
+        # when our model edge is stronger and displayed size is deeper.
+        edge_strength = 0.0
+        if expected_edge is not None:
+            edge_strength = min(max((expected_edge - min_edge) / 0.08, 0.0), 1.0)
+        displayed_size = best_ask_size if normalized_side.is_buy else best_bid_size
+        volume_strength = min(max(float(displayed_size or 0.0) / 250.0, 0.0), 1.0)
+        aggressiveness = min(0.30 + (0.25 * edge_strength) + (0.10 * volume_strength), 0.85)
+
         if normalized_side.is_buy:
-            raw_price = midpoint - spread_offset
-            our_price = max(raw_price, inside_bid)
-            our_price = min(our_price, inside_ask)
+            our_price = best_bid + (spread * aggressiveness)
+            our_price = min(max(our_price, inside_bid), inside_ask)
         else:
-            raw_price = midpoint + spread_offset
-            our_price = min(raw_price, inside_ask)
-            our_price = max(our_price, inside_bid)
+            our_price = best_ask - (spread * aggressiveness)
+            our_price = max(min(our_price, inside_ask), inside_bid)
 
         rounded = round(round(our_price / tick_size) * tick_size, 4)
         rounded = max(inside_bid, min(rounded, inside_ask))
@@ -353,10 +367,10 @@ class LimitOrderManager:
 
         if model_probability is not None:
             if normalized_side.is_buy:
-                expected_edge = float(model_probability) - rounded
+                realized_edge = float(model_probability) - rounded
             else:
-                expected_edge = rounded - float(model_probability)
-            if expected_edge < min_edge:
+                realized_edge = rounded - float(model_probability)
+            if realized_edge < min_edge:
                 return None
 
         return rounded
@@ -697,6 +711,13 @@ class LimitOrderManager:
         return current_orderbooks.get(placed_order.order.market_id)
 
     def _best_bid_ask(self, orderbook: dict | OrderBookSnapshot) -> tuple[float | None, float | None]:
+        best_bid, _best_bid_size, best_ask, _best_ask_size = self._best_bid_ask_with_size(orderbook)
+        return best_bid, best_ask
+
+    def _best_bid_ask_with_size(
+        self,
+        orderbook: dict | OrderBookSnapshot,
+    ) -> tuple[float | None, float | None, float | None, float | None]:
         bids = getattr(orderbook, "bids", None)
         asks = getattr(orderbook, "asks", None)
         if bids is None and isinstance(orderbook, dict):
@@ -709,9 +730,13 @@ class LimitOrderManager:
         normalized_bids = [level for level in normalized_bids if level is not None]
         normalized_asks = [level for level in normalized_asks if level is not None]
 
-        best_bid = max((price for price, _ in normalized_bids), default=None)
-        best_ask = min((price for price, _ in normalized_asks), default=None)
-        return best_bid, best_ask
+        best_bid_level = max(normalized_bids, key=lambda level: level[0], default=None)
+        best_ask_level = min(normalized_asks, key=lambda level: level[0], default=None)
+        best_bid = best_bid_level[0] if best_bid_level else None
+        best_bid_size = best_bid_level[1] if best_bid_level else None
+        best_ask = best_ask_level[0] if best_ask_level else None
+        best_ask_size = best_ask_level[1] if best_ask_level else None
+        return best_bid, best_bid_size, best_ask, best_ask_size
 
     def _normalize_level(self, level) -> tuple[float, float] | None:
         if isinstance(level, dict):
