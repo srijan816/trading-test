@@ -28,6 +28,8 @@ def build_scheduler(app_config: AppConfig, jobs: dict[str, Callable[..., object]
     scheduler.add_job(jobs["check_manual_responses"], "interval", minutes=int(app_config.scheduler["check_manual_responses_minutes"]), id="check_manual_responses", replace_existing=True)
     if "monitor_intraday" in jobs:
         scheduler.add_job(jobs["monitor_intraday"], "interval", minutes=15, id="monitor_intraday", replace_existing=True)
+    if "manage_open_positions" in jobs:
+        scheduler.add_job(jobs["manage_open_positions"], "interval", minutes=15, id="manage_open_positions", replace_existing=True)
     if "capture_daily_snapshots" in jobs and app_config.scheduler.get("daily_snapshot_cron"):
         scheduler.add_job(
             jobs["capture_daily_snapshots"],

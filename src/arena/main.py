@@ -11,7 +11,7 @@ load_dotenv()
 
 import argparse
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 import logging
 import os
@@ -27,7 +27,7 @@ from arena.db import ArenaDB
 from arena.engine.limit_order_manager import LimitOrderManager
 from arena.engine.paper_executor import PaperExecutor
 from arena.engine.paper_limit_executor import PaperLimitExecutor
-from arena.engine.portfolio import apply_execution_to_portfolio, compute_position_unrealized
+from arena.engine.portfolio import apply_execution_to_portfolio, close_position, compute_position_unrealized
 from arena.engine.settlement import SettlementEngine
 from arena.exchanges.kalshi_adapter import KalshiAdapter as KalshiExchangeAdapter
 from arena.exchanges.polymarket_limit import PolymarketPublicReader
@@ -842,6 +842,30 @@ def infer_fee_bps(app_config: AppConfig, market_row) -> float:
     return float(app_config.fees[mapping.get(category, "default_event_bps")])
 
 
+def _position_exit_signal(position, candidate: dict, now: datetime) -> dict | None:
+    held_yes = str(position.outcome_label).lower() == "yes"
+    outcome = candidate["yes_outcome"] if held_yes else candidate["no_outcome"]
+    fair_probability = float(candidate["predicted_yes"]) if held_yes else 1.0 - float(candidate["predicted_yes"])
+    exit_bid = float(outcome.get("best_bid") or outcome.get("mid_price") or 0.0)
+    if exit_bid <= 0:
+        return None
+
+    hold_edge_bps = int(round((fair_probability - exit_bid) * 10000))
+    pnl_pct = (exit_bid - float(position.avg_entry_price)) / max(float(position.avg_entry_price), 1e-9)
+    end_time = datetime.fromisoformat(str(candidate["market"]["end_time"]))
+    if end_time.tzinfo is None:
+        end_time = end_time.replace(tzinfo=timezone.utc)
+    hours_remaining = max((end_time - now).total_seconds() / 3600.0, 0.0)
+
+    if hold_edge_bps <= -300:
+        return {"reason": "edge_reversal", "exit_bid": exit_bid, "hold_edge_bps": hold_edge_bps, "pnl_pct": pnl_pct, "hours_remaining": hours_remaining}
+    if pnl_pct <= -0.15:
+        return {"reason": "stop_loss", "exit_bid": exit_bid, "hold_edge_bps": hold_edge_bps, "pnl_pct": pnl_pct, "hours_remaining": hours_remaining}
+    if hours_remaining <= 12.0 and abs(hold_edge_bps) <= 300:
+        return {"reason": "time_exit", "exit_bid": exit_bid, "hold_edge_bps": hold_edge_bps, "pnl_pct": pnl_pct, "hours_remaining": hours_remaining}
+    return None
+
+
 async def _submit_paper_limit_order(
     app_config: AppConfig,
     db: ArenaDB,
@@ -994,6 +1018,91 @@ def _limit_order_metrics(db: ArenaDB, lookback_hours: int = 24) -> dict[str, flo
         "avg_time_to_fill_seconds": round(sum(fill_durations) / len(fill_durations), 3) if fill_durations else None,
         "avg_midpoint_slippage_cents": round(sum(midpoint_slippages) / len(midpoint_slippages), 4) if midpoint_slippages else None,
     }
+
+
+async def manage_open_positions(app_config: AppConfig, db: ArenaDB) -> None:
+    now = utc_now()
+    closed_count = 0
+    forecast_cfg = app_config.strategies.get("algo_forecast")
+    if forecast_cfg is None:
+        return
+    strategy = ForecastConsensusStrategy(db=db, strategy_config=forecast_cfg.strategy)
+    weather_markets = {
+        (str(row["market_id"]), str(row["venue"])): row
+        for row in db.list_markets(category="weather", status="active")
+    }
+
+    for position in db.list_open_positions():
+        key = (str(position.market_id), str(position.venue))
+        market_row = weather_markets.get(key)
+        if market_row is None:
+            continue
+        candidate = await strategy._evaluate_market(market_row, now)
+        if candidate is None:
+            continue
+        exit_signal = _position_exit_signal(position, candidate, now)
+        if exit_signal is None:
+            continue
+
+        exit_price = float(exit_signal["exit_bid"])
+        payout = position.quantity * exit_price
+        fee_bps = infer_fee_bps(app_config, market_row)
+        fees = payout * (fee_bps / 10000.0)
+        net_payout = max(payout - fees, 0.0)
+
+        portfolio = db.get_portfolio(position.strategy_id)
+        if portfolio is None:
+            continue
+
+        execution = ExecutionResult(
+            execution_id=new_id("exec"),
+            decision_id=f"exit_{position.position_id}",
+            strategy_id=position.strategy_id,
+            timestamp=now,
+            action_type="SELL",
+            market_id=position.market_id,
+            venue=position.venue,
+            outcome_id=position.outcome_id,
+            status="filled",
+            requested_amount_usd=payout,
+            filled_quantity=position.quantity,
+            avg_fill_price=exit_price,
+            slippage_applied=0.0,
+            fees_applied=fees,
+            total_cost=net_payout,
+            rejection_reason=None,
+            orderbook_snapshot_id=new_id("book"),
+        )
+        closed_position = replace(
+            position,
+            status="closed",
+            current_price=exit_price,
+            unrealized_pnl=0.0,
+            last_updated_at=now,
+        )
+        db.save_execution(execution)
+        db.upsert_position(closed_position)
+        updated_portfolio = close_position(portfolio, position.position_id, net_payout)
+        db.save_portfolio(updated_portfolio)
+        db.record_event(
+            "position_exit",
+            {
+                "strategy_id": position.strategy_id,
+                "market_id": position.market_id,
+                "venue": position.venue,
+                "outcome_id": position.outcome_id,
+                "reason": exit_signal["reason"],
+                "exit_bid": exit_price,
+                "hold_edge_bps": exit_signal["hold_edge_bps"],
+                "pnl_pct": round(exit_signal["pnl_pct"], 6),
+                "hours_remaining": round(exit_signal["hours_remaining"], 3),
+            },
+            strategy_id=position.strategy_id,
+        )
+        closed_count += 1
+
+    if closed_count:
+        logger.info("position manager closed %d open positions", closed_count)
 
 
 async def mark_to_market(app_config: AppConfig, db: ArenaDB) -> None:
@@ -1539,6 +1648,7 @@ def main(argv: list[str] | None = None) -> None:
                 "poll_resolutions": lambda: asyncio.run(poll_resolutions(app_config, db)),
                 "mark_to_market": lambda: asyncio.run(mark_to_market(app_config, db)),
                 "monitor_limit_orders": lambda: asyncio.run(monitor_limit_orders(app_config, db, execution_services)),
+                "manage_open_positions": lambda: asyncio.run(manage_open_positions(app_config, db)),
                 "export_dashboard": lambda: export_dashboard(app_config, db),
                 "check_manual_responses": lambda: None,
                 "run_strategy": lambda strategy_id: asyncio.run(
