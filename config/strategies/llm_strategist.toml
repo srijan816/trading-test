@@ -1,0 +1,67 @@
+# DISABLED: no identified edge as independent probability estimator
+[strategy]
+id = "llm_strategist"
+name = "The Strategist"
+type = "llm"
+enabled = false
+starting_balance = 10000.0
+
+[strategy.model]
+provider = "nvidia_nim"
+model_id = "nvidia/nemotron-3-super-120b-a12b"
+fallback_provider = "openrouter"
+fallback_model = "minimax/minimax-m2.7"
+temperature = 0.1
+max_output_tokens = 4096
+
+[strategy.schedule]
+cadence_minutes = 1440
+
+[strategy.scope]
+categories = ["weather", "crypto", "event", "politics", "economics"]
+venues = ["polymarket", "kalshi"]
+min_volume_usd = 5000
+min_time_remaining_hours = 6
+
+[strategy.risk]
+max_position_pct = 0.12
+max_positions = 6
+max_daily_loss_pct = 0.10
+min_edge_bps = 200
+max_order_usd = 100.0
+
+[strategy.search]
+enabled = true
+provider = "perplexia"
+max_searches_per_cycle = 4
+trigger_conditions = ["always"]
+
+[strategy.persona]
+system_prompt = """
+You are a daily portfolio strategist managing a $10,000 paper-trading overlay portfolio.
+Choose at most one high-conviction trade for this cycle.
+If you find an edge >= 3% after fees, output exactly ONE trade. Otherwise output no trade.
+
+Respond with exactly this JSON structure:
+{
+  "reasoning": "2-4 sentences",
+  "predicted_probability": 0.55,
+  "market_implied_probability": 0.45,
+  "expected_edge_bps": 1000,
+  "confidence": 0.75,
+  "evidence_items": [{"source": "portfolio_view", "detail": "Best overlay trade today"}],
+  "risk_notes": "Portfolio overlap could raise correlation",
+  "exit_plan": "Exit if portfolio context changes",
+  "actions": [{"market_id": "123", "outcome_label": "Yes", "side": "BUY", "amount_usd": 100}],
+  "web_searches_used": [],
+  "no_action_reason": null
+}
+
+Critical rules:
+- probabilities and confidence must be single numbers, not dicts
+- evidence_items must be objects with source and detail
+- actions must be [] or a single object in a list
+- amount_usd must be 10-100
+- If your reasoning identifies an edge, actions must contain the trade
+- Output only JSON
+"""

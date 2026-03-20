@@ -1,0 +1,71 @@
+services:
+  # === SearXNG (Meta-Search Engine) ===
+  searxng:
+    image: searxng/searxng:latest
+    container_name: nexus-searxng
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8081
+    restart: unless-stopped
+    networks:
+      - nexus-net
+
+  # === Vane (Core Search + Synthesis Engine) ===
+  vane:
+    image: itzcrazykns1337/vane:latest
+    container_name: nexus-vane
+    ports:
+      - "3000:3000"
+    volumes:
+      - vane-data:/home/vane/data
+    environment:
+      - SEARXNG_API_URL=http://searxng:8080
+    depends_on:
+      - searxng
+    restart: unless-stopped
+    networks:
+      - nexus-net
+
+  crawl4ai:
+    image: unclecode/crawl4ai:latest
+    container_name: nexus-crawl4ai
+    ports:
+      - "11235:11235"
+    shm_size: "1g"
+    restart: unless-stopped
+    networks:
+      - nexus-net
+
+  # === Nexus Deep Research Layer ===
+  deep-research:
+    build: .
+    container_name: nexus-deep-research
+    ports:
+      - "3001:3001"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    environment:
+      - VANE_URL=http://vane:3000
+      - SEARXNG_URL=http://searxng:8080
+      - CRAWL4AI_URL=http://crawl4ai:11235
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - vane
+      - searxng
+      - crawl4ai
+    restart: unless-stopped
+    networks:
+      - nexus-net
+
+volumes:
+  vane-data:
+
+networks:
+  nexus-net:
+    driver: bridge

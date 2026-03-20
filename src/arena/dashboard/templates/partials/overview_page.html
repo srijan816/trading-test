@@ -1,0 +1,159 @@
+<div id="overview-page" class="page page-overview" hx-get="/api/overview" hx-trigger="every 30s" hx-swap="outerHTML">
+  <section class="grid-cards">
+    {% for card in content.portfolio_cards %}
+    <article class="card strategy-card">
+      <div class="card-header">
+        <h3>{{ card.name }}</h3>
+        <span class="muted">{{ card.strategy_id }}</span>
+      </div>
+      <div class="metric-grid">
+        <div>
+          <div class="metric-label">Cash</div>
+          <div class="metric-value mono">{{ card.cash|money }}</div>
+        </div>
+        <div>
+          <div class="metric-label">Total Value</div>
+          <div class="metric-value mono">{{ card.total_value|money }}</div>
+        </div>
+        <div>
+          <div class="metric-label">Realized P&amp;L</div>
+          <div class="metric-value mono {% if card.realized_pnl > 0 %}positive{% elif card.realized_pnl < 0 %}negative{% endif %}">{{ card.realized_pnl|money }}</div>
+        </div>
+        <div>
+          <div class="metric-label">Unrealized</div>
+          <div class="metric-value mono {% if card.unrealized_pnl > 0 %}positive{% elif card.unrealized_pnl < 0 %}negative{% endif %}">{{ card.unrealized_pnl|money }}</div>
+        </div>
+        <div>
+          <div class="metric-label">Win Rate</div>
+          <div class="metric-value mono">{{ card.win_rate|pct }}</div>
+        </div>
+        <div>
+          <div class="metric-label">Trades</div>
+          <div class="metric-value mono">{{ card.total_trades|intcomma }}</div>
+        </div>
+      </div>
+    </article>
+    {% endfor %}
+  </section>
+
+  <section class="card">
+    <div class="section-title">Recent Activity</div>
+    <div class="timeline">
+      {% for item in content.activity %}
+      <div class="timeline-item {{ item.status_class }}">
+        <div class="timeline-time mono" title="{{ item.timestamp|timestamp }}">{{ item.timestamp|relative_time }}</div>
+        <div class="timeline-body">
+          <div class="timeline-headline">
+            {{ item.headline }}
+            {% if item.reset_boundary == "post-reset" %}
+            <span class="badge badge-positive">post-reset</span>
+            {% elif item.reset_boundary == "pre-reset" %}
+            <span class="badge badge-warning">pre-reset</span>
+            {% endif %}
+          </div>
+          <div class="timeline-detail muted">{{ item.detail }}</div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="section-title">Research Pipeline Snapshot</div>
+    {% if content.research_summary.latest_reset_at %}
+    <div class="muted">Reset boundary: {{ content.research_summary.latest_reset_at|timestamp }}</div>
+    {% endif %}
+    <div class="metric-grid metric-grid-wide">
+      <div>
+        <div class="metric-label">Calls (24h)</div>
+        <div class="metric-value mono">{{ content.research_summary.total_calls|intcomma }}</div>
+      </div>
+      <div>
+        <div class="metric-label">Live</div>
+        <div class="metric-value mono">{{ content.research_summary.live_calls|intcomma }}</div>
+      </div>
+      <div>
+        <div class="metric-label">Cache Hits</div>
+        <div class="metric-value mono">{{ content.research_summary.cache_hits|intcomma }}</div>
+      </div>
+      <div>
+        <div class="metric-label">Errors</div>
+        <div class="metric-value mono">{{ content.research_summary.errors|intcomma }}</div>
+      </div>
+      <div>
+        <div class="metric-label">Used In Decisions</div>
+        <div class="metric-value mono">{{ content.research_summary.used_in_decision|intcomma }}</div>
+      </div>
+      <div>
+        <div class="metric-label">Reasoning Traces</div>
+        <div class="metric-value mono">{{ content.research_summary.reasoning_traces|intcomma }}</div>
+      </div>
+      <div>
+        <div class="metric-label">Avg Duration</div>
+        <div class="metric-value mono">{% if content.research_summary.avg_duration_ms is not none %}{{ content.research_summary.avg_duration_ms|num }} ms{% else %}n/a{% endif %}</div>
+      </div>
+      <div>
+        <div class="metric-label">Last Research</div>
+        <div class="metric-value">{% if content.research_summary.last_research_at %}{{ content.research_summary.last_research_at|relative_time }}{% else %}n/a{% endif %}</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="two-col">
+    <article class="card">
+      <div class="section-title">Edge Distribution</div>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Strategy</th>
+            <th>Market</th>
+            <th class="num">Edge</th>
+            <th class="num">Prob</th>
+            <th class="num">Amount</th>
+            <th>Time</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in content.edge_rows %}
+          <tr>
+            <td>{{ row.strategy_id }}</td>
+            <td title="{{ row.question }}">{{ row.question[:66] }}{% if row.question|length > 66 %}…{% endif %}</td>
+            <td class="num mono {% if row.edge_bps > 500 %}positive{% elif row.edge_bps >= 200 %}warning{% else %}muted{% endif %}">{{ row.edge_bps|bps }}</td>
+            <td class="num mono">{{ row.probability|pct }}</td>
+            <td class="num mono">{{ row.amount_usd|money }}</td>
+            <td title="{{ row.timestamp|timestamp }}">{{ row.timestamp|relative_time }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </article>
+
+    <article class="card">
+      <div class="section-title">Weather Forecast Monitor</div>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Location</th>
+            <th class="num">Ensemble High</th>
+            <th class="num">± Sigma</th>
+            <th class="num">Sources</th>
+            <th>Trend</th>
+            <th class="num">Last Obs</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in content.weather_rows %}
+          <tr>
+            <td title="{{ row.source_names }}">{{ row.location }}</td>
+            <td class="num mono">{{ row.ensemble_high_c|num }}C</td>
+            <td class="num mono">{{ row.sigma_c|num }}C</td>
+            <td class="num mono">{{ row.sources }}</td>
+            <td>{{ row.trend or "n/a" }}</td>
+            <td class="num mono" title="{{ row.obs_time|timestamp if row.obs_time else 'n/a' }}">{{ row.last_obs_c|num }}C</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </article>
+  </section>
+</div>

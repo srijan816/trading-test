@@ -1,0 +1,55 @@
+[providers.minimax]
+base_url = "https://api.minimax.io/v1"
+env_key = "MINIMAX_API_KEY"
+timeout_seconds = 90
+
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+env_key = "OPENROUTER_API_KEY"
+timeout_seconds = 45
+
+[providers.google_ai_studio]
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+env_key = "GEMINI_API_KEY"
+timeout_seconds = 60
+
+[providers.nvidia_direct]
+base_url = "https://integrate.api.nvidia.com/v1"
+env_key = "NVIDIA_API_KEY"
+timeout_seconds = 45
+
+[providers.nvidia_nim]
+base_url = "https://integrate.api.nvidia.com/v1"
+env_key = "NVIDIA_API_KEY"
+timeout_seconds = 45
+
+[providers.serper]
+env_key = "SERPER_API_KEY"
+base_url = "https://google.serper.dev"
+
+[providers.perplexia]
+env_key = "NEXUS_API_KEY"
+base_url = "http://localhost:3001/api/v1"
+timeout_seconds = 90
+
+[providers.google_sheets]
+env_key = "GOOGLE_APPLICATION_CREDENTIALS"
+spreadsheet_id = ""
+
+[models.minimax_m27]
+provider = "minimax"
+model_id = "MiniMax-M2.7"
+input_cost_per_million = 0.30
+output_cost_per_million = 1.20
+
+[models.gemini_flash_preview]
+provider = "google_ai_studio"
+model_id = "gemini-3-flash-preview"
+input_cost_per_million = 0.0
+output_cost_per_million = 0.0
+
+[models.nemotron]
+provider = "nvidia_nim"
+model_id = "nvidia/nemotron-3-super-120b-a12b"
+input_cost_per_million = 0.0
+output_cost_per_million = 0.0

@@ -1,0 +1,18 @@
+<div id="topbar" class="topbar" hx-get="/api/topbar" hx-trigger="every 30s" hx-swap="outerHTML">
+  <div class="topbar-item brand">{{ topbar.arena_name }}</div>
+  <div class="topbar-item">
+    <span class="badge {% if topbar.mode == 'paper' %}badge-positive{% else %}badge-negative{% endif %}">
+      {% if topbar.mode == 'paper' %}Paper Mode{% else %}LIVE TRADING{% endif %}
+    </span>
+  </div>
+  <div class="topbar-item">{{ topbar.active_strategy_count }} Strategies</div>
+  <div class="topbar-item">{{ topbar.market_count|intcomma }} Markets</div>
+  <div class="topbar-item">Burn-in Day {{ topbar.burnin_day or "n/a" }}</div>
+  <div class="topbar-item" title="{{ topbar.last_reset_at|timestamp if topbar.last_reset_at else 'n/a' }}">Last reset: {{ topbar.last_reset_rel }}</div>
+  <div class="topbar-item">PID: {{ topbar.pid_info.pid or "n/a" }}</div>
+  <div class="topbar-item" title="{{ topbar.last_scan_at|timestamp if topbar.last_scan_at else 'n/a' }}">Last scan: {{ topbar.last_scan_rel }}</div>
+  <div class="topbar-item live-dot {% if topbar.pid_info.alive %}positive{% else %}negative{% endif %}">
+    <span class="dot"></span>
+    {{ topbar.live_status }}
+  </div>
+</div>

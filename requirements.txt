@@ -1,0 +1,2 @@
+properscoring>=0.1
+pykalshi>=0.5.0

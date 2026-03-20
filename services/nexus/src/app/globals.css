@@ -1,0 +1,111 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+:root {
+  --background: #0d0d0f;
+  --foreground: #ececf1;
+}
+
+body {
+  color: var(--foreground);
+  background: var(--background);
+  font-family: 'Inter', system-ui, sans-serif;
+}
+
+/* Markdown content styling */
+.markdown-content h1 {
+  @apply text-2xl font-bold mt-6 mb-3 text-white;
+}
+
+.markdown-content h2 {
+  @apply text-xl font-semibold mt-5 mb-2 text-white;
+}
+
+.markdown-content h3 {
+  @apply text-lg font-semibold mt-4 mb-2 text-gray-200;
+}
+
+.markdown-content p {
+  @apply mb-3 leading-relaxed text-gray-300;
+}
+
+.markdown-content ul,
+.markdown-content ol {
+  @apply mb-3 pl-6;
+}
+
+.markdown-content li {
+  @apply mb-1 text-gray-300;
+}
+
+.markdown-content ul li {
+  @apply list-disc;
+}
+
+.markdown-content ol li {
+  @apply list-decimal;
+}
+
+.markdown-content code {
+  @apply bg-dark-800 text-gray-200 px-1.5 py-0.5 rounded text-sm;
+}
+
+.markdown-content pre {
+  @apply bg-dark-800 rounded-lg p-4 mb-3 overflow-x-auto;
+}
+
+.markdown-content pre code {
+  @apply bg-transparent p-0;
+}
+
+.markdown-content blockquote {
+  @apply border-l-4 border-dark-600 pl-4 italic text-gray-400 mb-3;
+}
+
+.markdown-content a {
+  @apply text-blue-400 hover:text-blue-300 underline;
+}
+
+.markdown-content table {
+  @apply w-full mb-3 border-collapse;
+}
+
+.markdown-content th,
+.markdown-content td {
+  @apply border border-dark-700 px-3 py-2 text-sm;
+}
+
+.markdown-content th {
+  @apply bg-dark-800 font-semibold text-gray-200;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #565869;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #8e8ea0;
+}
+
+/* Animations */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+.animate-pulse-dot {
+  animation: pulse-dot 1.5s ease-in-out infinite;
+}

@@ -1,0 +1,118 @@
+<div id="forecast-accuracy-page" class="page" hx-get="/api/forecast-accuracy" hx-trigger="every 30s" hx-swap="outerHTML">
+  <section class="card">
+    <div class="section-title">Forecast vs Actual</div>
+    {% if content.has_actuals %}
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Location</th>
+          <th>Source</th>
+          <th class="num">Forecasts</th>
+          <th class="num">With Actuals</th>
+          <th class="num">Bias (C)</th>
+          <th class="num">RMSE</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in content.accuracy_rows if row.with_actuals > 0 %}
+        <tr>
+          <td>{{ row.location }}</td>
+          <td>{{ row.source }}</td>
+          <td class="num mono">{{ row.forecasts }}</td>
+          <td class="num mono">{{ row.with_actuals }}</td>
+          <td class="num mono {% if row.bias_c > 0 %}warning{% elif row.bias_c < 0 %}negative{% endif %}">{{ row.bias_c|num }}</td>
+          <td class="num mono">{{ row.rmse|num }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">No markets have resolved yet. Forecast accuracy will appear here after the first resolution.</div>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <div class="section-title">Ensemble Performance</div>
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Location</th>
+          <th class="num">Ensemble RMSE</th>
+          <th>Best Single Source</th>
+          <th class="num">Sigma Used</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% if content.ensemble_rows %}
+          {% for row in content.ensemble_rows %}
+          <tr>
+            <td>{{ row.location }}</td>
+            <td class="num mono">{{ row.ensemble_rmse|num }}</td>
+            <td>{{ row.best_single_source or "n/a" }}</td>
+            <td class="num mono">{{ row.sigma_used|num }}</td>
+          </tr>
+          {% endfor %}
+        {% else %}
+          <tr><td colspan="4" class="empty-state">No ensemble-vs-actual rows yet.</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </section>
+
+  <section class="two-col">
+    <article class="card">
+      <div class="section-title">Observation Coverage</div>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Location</th>
+            <th class="num">Obs (24h)</th>
+            <th class="num">Latest Temp</th>
+            <th class="num">Max Today</th>
+            <th>Trend</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in content.observation_rows %}
+          <tr>
+            <td>{{ row.location }}</td>
+            <td class="num mono">{{ row.observations_24h }}</td>
+            <td class="num mono">{{ row.latest_temp_c|num }}C</td>
+            <td class="num mono">{{ row.max_today_c|num }}C</td>
+            <td>{{ row.trend or "n/a" }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </article>
+
+    <article class="card">
+      <div class="section-title">Source Disagreement</div>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Location</th>
+            <th class="num">Open-Meteo</th>
+            <th class="num">ECMWF</th>
+            <th class="num">GFS</th>
+            <th class="num">HKO</th>
+            <th class="num">Spread</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in content.disagreement_rows %}
+          <tr>
+            <td>{{ row.location }}</td>
+            <td class="num mono">{{ row.open_meteo|num }}</td>
+            <td class="num mono">{{ row.ecmwf|num }}</td>
+            <td class="num mono">{{ row.gfs|num }}</td>
+            <td class="num mono">{{ row.hko|num }}</td>
+            <td class="num mono">{{ row.spread|num }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </article>
+  </section>
+</div>
+

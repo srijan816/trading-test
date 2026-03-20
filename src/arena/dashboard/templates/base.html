@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Arena Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+</head>
+<body data-page="{{ current_page }}">
+  {% include "partials/topbar.html" %}
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-title">Navigation</div>
+        <nav class="nav-list">
+          {% for item in nav_items %}
+          {% if item.page != "research_pipeline" %}
+          <a href="{{ item.path }}"
+             class="nav-link {% if current_page == item.page %}active{% endif %}"
+             hx-get="{{ item.api_path }}"
+             hx-target="#content"
+             hx-swap="innerHTML"
+             hx-push-url="{{ item.path }}"
+             hx-on:click="document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active')); this.classList.add('active')">
+            {{ item.label }}
+          </a>
+          {% endif %}
+          {% endfor %}
+          <a href="/research-pipeline"
+             class="nav-link {% if current_page == 'research_pipeline' %}active{% endif %}"
+             hx-get="/api/research-pipeline"
+             hx-target="#content"
+             hx-swap="innerHTML"
+             hx-push-url="/research-pipeline"
+             hx-on:click="document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active')); this.classList.add('active')">
+            Research Pipeline
+          </a>
+        </nav>
+      </div>
+    </aside>
+    <main id="content" class="content">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</body>
+</html>

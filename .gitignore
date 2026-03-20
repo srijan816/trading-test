@@ -1,0 +1,55 @@
+# Nexus
+services/nexus/node_modules/
+services/nexus/data/
+services/nexus/dist/
+services/nexus/.next/
+services/nexus/.env
+
+# Runtime
+data/logs/
+data/pids/
+data/cache/
+data/crps_history.jsonl
+__pycache__/
+
+# Secrets & credentials
+.env
+google.json
+
+# Virtual environment
+.venv/
+
+# Python
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Playwright
+.playwright-mcp/
+
+# OS
+.DS_Store
+*.swp
+*.swo
+
+# Local data & state
+data/
+logs/
+
+# Local DB (paper trading state)
+data/arena.db
+data/*.db-shm
+data/*.db-wal
+
+# Reports (auto-generated)
+reports/
+
+# Temporary/state files
+*.tmp
+*.state
+portfolio_state.json
+paper_positions.json
+account_state.json

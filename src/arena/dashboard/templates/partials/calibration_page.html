@@ -1,0 +1,145 @@
+<div id="calibration-page" class="page" hx-get="/api/calibration" hx-trigger="every 30s" hx-swap="outerHTML">
+  <section class="card">
+    <div class="section-title">Strategy Health</div>
+    {% if content.strategy_health %}
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Strategy</th>
+          <th class="num">Brier</th>
+          <th class="num">Cal Error</th>
+          <th class="num">Overconfidence</th>
+          <th class="num">Sample Size</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in content.strategy_health %}
+        <tr>
+          <td>{{ row.strategy_id }}</td>
+          <td class="num mono">{{ row.rolling_brier|num }}</td>
+          <td class="num mono">{{ row.calibration_error|num }}</td>
+          <td class="num mono">{{ row.overconfidence_rate|num }}</td>
+          <td class="num mono">{{ row.sample_size }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">Calibration data will appear after markets resolve.</div>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <div class="section-title">Calibration Curve</div>
+    {% if content.calibration_curve %}
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Predicted Bin</th>
+          <th class="num">Mean Pred</th>
+          <th class="num">Mean Actual</th>
+          <th class="num">Count</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in content.calibration_curve %}
+        <tr>
+          <td>{{ row.label }}</td>
+          <td class="num mono">{{ row.mean_pred|pct }}</td>
+          <td class="num mono">{{ row.mean_actual|pct }}</td>
+          <td class="num mono">{{ row.count }}</td>
+          <td>{% if row.status == 'good' %}✓{% elif row.status == 'warn' %}⚠{% else %}✗{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">No scored decisions yet.</div>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <div class="section-title">Pending Parameter Adjustments</div>
+    {% if content.adjustments %}
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Strategy</th>
+          <th>Parameter</th>
+          <th class="num">Current</th>
+          <th class="num">Recommended</th>
+          <th>Reason</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in content.adjustments %}
+        <tr>
+          <td>{{ row.strategy_id }}</td>
+          <td>{{ row.parameter_name }}</td>
+          <td class="num mono">{{ row.current_value|num }}</td>
+          <td class="num mono">{{ row.recommended_value|num }}</td>
+          <td>{{ row.reason }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">No adjustments recommended yet.</div>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <div class="section-title">Sigma Calibration Reference</div>
+    <div class="metric-grid metric-grid-wide">
+      <div><div class="metric-label">Best Method</div><div class="metric-value mono">{{ content.sigma_reference.best_method or "n/a" }}</div></div>
+      <div><div class="metric-label">Sigma Multiplier</div><div class="metric-value mono">{{ content.sigma_reference.best_sigma_multiplier|num }}</div></div>
+      <div><div class="metric-label">Best Brier</div><div class="metric-value mono">{{ content.sigma_reference.best_brier|num }}</div></div>
+    </div>
+    <div class="two-col">
+      <article>
+        <div class="subsection-title">Per-Location Multipliers</div>
+        <table class="data-table compact">
+          <thead>
+            <tr>
+              <th>Location</th>
+              <th>Method</th>
+              <th class="num">Sigma Mult</th>
+              <th class="num">Brier</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for location, item in (content.sigma_reference.per_location or {}).items() %}
+            <tr>
+              <td>{{ location }}</td>
+              <td>{{ item.method }}</td>
+              <td class="num mono">{{ item.sigma_mult|num }}</td>
+              <td class="num mono">{{ item.brier|num }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </article>
+      <article>
+        <div class="subsection-title">Source RMSE</div>
+        <table class="data-table compact">
+          <thead>
+            <tr>
+              <th>Source</th>
+              <th>Reference</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for source, item in (content.sigma_reference.source_rmse or {}).items() %}
+            <tr>
+              <td>{{ source }}</td>
+              <td class="mono">{{ item }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </article>
+    </div>
+  </section>
+</div>
+

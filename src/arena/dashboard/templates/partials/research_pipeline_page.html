@@ -1,0 +1,175 @@
+{% set stats = namespace(total=0, cache=0, used=0, live_duration_total=0, live_duration_count=0) %}
+{% for row in content.entries %}
+  {% set stats.total = stats.total + 1 %}
+  {% if row.from_cache %}
+    {% set stats.cache = stats.cache + 1 %}
+  {% endif %}
+  {% if row.used_in_decision %}
+    {% set stats.used = stats.used + 1 %}
+  {% endif %}
+  {% if (not row.from_cache) and row.duration_ms is not none %}
+    {% set stats.live_duration_total = stats.live_duration_total + row.duration_ms %}
+    {% set stats.live_duration_count = stats.live_duration_count + 1 %}
+  {% endif %}
+{% endfor %}
+{% set cache_hit_rate = ((stats.cache / stats.total) * 100) if stats.total else none %}
+{% set avg_live_duration = (stats.live_duration_total / stats.live_duration_count) if stats.live_duration_count else none %}
+{% set most_used_model = content.summary.top_models[0].model if content.summary.top_models else "n/a" %}
+
+<div id="research-pipeline-page"
+     class="page"
+     hx-get="/api/research-pipeline"
+     hx-trigger="every 30s"
+     hx-include="#research-filters"
+     hx-swap="outerHTML">
+  <section class="card">
+    <div class="section-title">Research Pipeline</div>
+    {% if content.latest_reset_at %}
+    <div class="muted">Reset boundary: {{ content.latest_reset_at|timestamp }}. Pre-reset rows are preserved for calibration history.</div>
+    {% endif %}
+    <form id="research-filters"
+          class="filters"
+          hx-get="/api/research-pipeline"
+          hx-target="#research-pipeline-page"
+          hx-swap="outerHTML">
+      <label>
+        <span>Strategy</span>
+        <select name="strategy">
+          {% for option in content.strategy_options %}
+          <option value="{{ option }}" {% if option == content.filters.strategy %}selected{% endif %}>{{ option }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        <span>Endpoint</span>
+        <select name="endpoint">
+          {% for option in content.endpoint_options %}
+          <option value="{{ option }}" {% if option == content.filters.endpoint %}selected{% endif %}>{{ option }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        <span>Date Range</span>
+        <select name="date_range">
+          {% for value, label in [("today", "Today"), ("last3", "Last 3 Days"), ("last7", "Last 7 Days"), ("all", "All")] %}
+          <option value="{{ value }}" {% if value == content.filters.date_range %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+    </form>
+
+    <div class="metric-grid metric-grid-wide">
+      <div>
+        <div class="metric-label">Total Calls (24h)</div>
+        <div class="metric-value mono">{{ stats.total|intcomma }}</div>
+      </div>
+      <div>
+        <div class="metric-label">Cache Hit Rate</div>
+        <div class="metric-value mono">{% if cache_hit_rate is not none %}{{ cache_hit_rate|pct_points }}{% else %}n/a{% endif %}</div>
+      </div>
+      <div>
+        <div class="metric-label">Avg Live Duration</div>
+        <div class="metric-value mono">{% if avg_live_duration is not none %}{{ avg_live_duration|num }} ms{% else %}n/a{% endif %}</div>
+      </div>
+      <div>
+        <div class="metric-label">Most-Used Model</div>
+        <div class="metric-value">{{ most_used_model }}</div>
+      </div>
+      <div>
+        <div class="metric-label">Used In Decisions</div>
+        <div class="metric-value mono">{{ stats.used|intcomma }} / {{ stats.total|intcomma }}</div>
+      </div>
+    </div>
+
+    <div class="summary-strip">
+      <span>Total: <strong class="mono">{{ content.summary.total_calls|intcomma }}</strong></span>
+      <span>Fresh: <strong class="mono">{{ content.summary.fresh_calls|intcomma }}</strong></span>
+      <span>Cache Hits: <strong class="mono">{{ content.summary.cache_hits|intcomma }}</strong></span>
+      <span>Errors: <strong class="mono">{{ content.summary.errors|intcomma }}</strong></span>
+      <span>Used In Decision: <strong class="mono">{{ content.summary.used_in_decision|intcomma }}</strong></span>
+      <span>Avg Duration: <strong class="mono">{% if content.summary.avg_duration_ms is not none %}{{ content.summary.avg_duration_ms|num }} ms{% else %}n/a{% endif %}</strong></span>
+      <span>Avg Sources: <strong class="mono">{% if content.summary.avg_sources is not none %}{{ content.summary.avg_sources|num }}{% else %}n/a{% endif %}</strong></span>
+    </div>
+
+    {% if content.summary.top_models %}
+    <div class="summary-strip">
+      {% for item in content.summary.top_models %}
+      <span>{{ item.model }}: <strong class="mono">{{ item.count|intcomma }}</strong></span>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    <div class="decision-layout">
+      <div class="decision-table-wrap">
+        <table class="data-table compact">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Strategy</th>
+              <th>Reset</th>
+              <th>Market</th>
+              <th>Endpoint</th>
+              <th>Mode</th>
+              <th>Model</th>
+              <th>RT</th>
+              <th class="num">Duration</th>
+              <th class="num">Sources</th>
+              <th>Cache</th>
+              <th>Used</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in content.entries %}
+            <tr class="clickable {{ row.status }}"
+                style="{% if row.error %}background: rgba(248, 81, 73, 0.12);{% endif %}{% if row.used_in_decision %}border-left: 3px solid var(--green);{% endif %}"
+                hx-get="/api/research/{{ row.id }}"
+                hx-target="#research-detail"
+                hx-swap="innerHTML">
+              <td title="{{ row.timestamp|timestamp }}">{{ row.timestamp|relative_time }}</td>
+              <td>{{ row.strategy }}</td>
+              <td>
+                {% if row.reset_boundary == "post-reset" %}
+                <span class="badge badge-positive">post</span>
+                {% elif row.reset_boundary == "pre-reset" %}
+                <span class="badge badge-warning">pre</span>
+                {% else %}
+                <span class="muted">-</span>
+                {% endif %}
+              </td>
+              <td title="{{ row.market_question }}"{% if row.from_cache %} style="font-style: italic;"{% endif %}>{{ row.market_question[:70] }}{% if row.market_question|length > 70 %}…{% endif %}</td>
+              <td class="mono">{{ row.endpoint.replace('/api/v1/', '') }}</td>
+              <td class="mono">{{ row.mode }}</td>
+              <td title="{{ row.model_used }}">{{ row.model_used[:28] }}{% if row.model_used|length > 28 %}…{% endif %}</td>
+              <td>
+                {% if row.has_reasoning_trace %}
+                <span class="badge badge-neutral" title="Reasoning trace captured">RT</span>
+                {% else %}
+                <span class="muted">-</span>
+                {% endif %}
+              </td>
+              <td class="num mono {% if row.duration_ms is not none and row.duration_ms > 30000 %}warning{% endif %}">{% if row.duration_ms is not none %}{{ row.duration_ms|intcomma }} ms{% else %}n/a{% endif %}</td>
+              <td class="num mono">{{ row.sources_count|intcomma }}</td>
+              <td>
+                <span class="badge {% if row.from_cache %}badge-warning{% else %}badge-neutral{% endif %}"{% if row.from_cache %} style="font-style: italic;"{% endif %}>{{ "cached" if row.from_cache else "live" }}</span>
+              </td>
+              <td><span class="badge {% if row.used_in_decision %}badge-positive{% else %}badge-neutral{% endif %}">{{ "yes" if row.used_in_decision else "no" }}</span></td>
+              <td>
+                <span class="badge {% if row.error %}badge-negative{% elif row.from_cache %}badge-warning{% else %}badge-positive{% endif %}">
+                  {% if row.error %}error{% elif row.from_cache %}cache{% else %}ok{% endif %}
+                </span>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% if not content.entries %}
+        <div class="empty-state">No research pipeline rows yet. Once Nexus-backed calls run, they will appear here.</div>
+        {% endif %}
+      </div>
+      <aside id="research-detail" class="card decision-detail">
+        <div class="empty-state">Click a research row to inspect the exact query, returned report, sources, probability, and cache/decision usage flags.</div>
+      </aside>
+    </div>
+  </section>
+</div>

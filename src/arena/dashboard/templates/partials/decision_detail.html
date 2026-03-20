@@ -1,0 +1,127 @@
+{% if not detail %}
+<div class="empty-state">Decision not found.</div>
+{% else %}
+<div class="detail-header">
+  <div>
+    <div class="section-title">Decision Detail</div>
+    <div class="mono">{{ detail.decision_id }}</div>
+  </div>
+  <div class="muted">{{ detail.strategy_name }} · {{ detail.timestamp|timestamp }}</div>
+</div>
+
+<div class="detail-block">
+  <h4>Market</h4>
+  <div class="kv-grid">
+    <div><span class="label">Question</span><span>{{ detail.market.question or "n/a" }}</span></div>
+    <div><span class="label">Yes Ask</span><span class="mono">{{ detail.market.yes_ask|num }}</span></div>
+    <div><span class="label">No Ask</span><span class="mono">{{ detail.market.no_ask|num }}</span></div>
+    <div><span class="label">Category</span><span>{{ detail.market.category or "n/a" }}</span></div>
+    <div><span class="label">Venue</span><span>{{ detail.market.venue or "n/a" }}</span></div>
+    <div><span class="label">Resolves</span><span title="{{ detail.market.end_time|timestamp if detail.market.end_time else 'n/a' }}">{{ detail.market.end_time|relative_time if detail.market.end_time else "n/a" }}</span></div>
+  </div>
+</div>
+
+<div class="detail-block">
+  <h4>Probability Estimation</h4>
+  <div class="kv-grid">
+    <div><span class="label">Predicted Probability</span><span class="mono">{{ detail.probability.predicted_probability|pct }}</span></div>
+    <div><span class="label">Ensemble Method</span><span>{{ detail.probability.ensemble.ensemble_method or "n/a" }}</span></div>
+    <div><span class="label">Ensemble High</span><span class="mono">{{ detail.probability.ensemble.ensemble_high_c|num }}C</span></div>
+    <div><span class="label">Sigma</span><span class="mono">{{ detail.probability.ensemble.ensemble_sigma_c|num }}C</span></div>
+    <div><span class="label">Sources</span><span>{{ detail.probability.ensemble.sources_used or "n/a" }}{% if detail.probability.ensemble.source_names %} ({{ detail.probability.ensemble.source_names|join(', ') }}){% endif %}</span></div>
+    <div><span class="label">Sigma Multiplier</span><span class="mono">{{ detail.probability.ensemble.sigma_multiplier|num }}</span></div>
+    <div><span class="label">Bias Corrections</span><span>{% if detail.probability.ensemble.bias_corrections_applied %}{% for source, bias in detail.probability.ensemble.bias_corrections_applied.items() %}<span class="mono">{{ source }} {{ bias|num }}C</span>{% if not loop.last %}, {% endif %}{% endfor %}{% else %}n/a{% endif %}</span></div>
+    <div><span class="label">Intraday</span><span>{{ "Yes" if detail.probability.intraday else "No" }}</span></div>
+  </div>
+</div>
+
+<div class="detail-block">
+  <h4>Edge Calculation</h4>
+  <div class="kv-grid">
+    <div><span class="label">Raw Edge</span><span class="mono">{{ detail.edge.raw_edge_pct|pct_points }}</span></div>
+    <div><span class="label">Capped Edge</span><span class="mono">{{ detail.edge.capped_edge_bps|bps }}</span></div>
+    <div><span class="label">Side</span><span>{{ detail.edge.side }}</span></div>
+    <div><span class="label">Fee Rate</span><span class="mono">{{ detail.edge.fee_rate|pct }}</span></div>
+    <div><span class="label">Edge After Fees</span><span class="mono">{{ detail.edge.edge_after_fees_pct|pct_points }}</span></div>
+  </div>
+</div>
+
+<div class="detail-block">
+  <h4>Position Sizing (Kelly)</h4>
+  <div class="kv-grid">
+    <div><span class="label">Full Kelly Fraction</span><span class="mono">{{ detail.position_sizing.kelly_full|num }}</span></div>
+    <div><span class="label">Quarter Kelly</span><span class="mono">{{ detail.position_sizing.quarter_kelly|num }}</span></div>
+    <div><span class="label">Bankroll</span><span class="mono">{{ detail.position_sizing.bankroll|money }}</span></div>
+    <div><span class="label">Raw Amount</span><span class="mono">{{ detail.position_sizing.raw_amount|money }}</span></div>
+    <div><span class="label">Capped At</span><span class="mono">{{ detail.position_sizing.capped_at|money }}</span></div>
+    <div><span class="label">Final Amount</span><span class="mono">{{ detail.position_sizing.final_amount|money }}</span></div>
+  </div>
+</div>
+
+<div class="detail-block">
+  <h4>Risk Check</h4>
+  <div class="kv-grid">
+    <div><span class="label">Daily Trades</span><span>{{ detail.risk_check.daily_trades }}/{{ detail.risk_check.max_daily_trades }}</span></div>
+    <div><span class="label">Daily Spend</span><span class="mono">{{ detail.risk_check.daily_spend|money }}/{{ detail.risk_check.max_daily_loss_usd|money }}</span></div>
+    <div><span class="label">Open Positions</span><span>{{ detail.risk_check.open_positions }}/{{ detail.risk_check.max_open_positions }}</span></div>
+    <div><span class="label">Per-Market Exposure</span><span class="mono">{{ detail.risk_check.per_market_exposure|money }}/{{ detail.risk_check.max_exposure_per_market_usd|money }}</span></div>
+    <div><span class="label">Total Exposure</span><span class="mono">{{ detail.risk_check.total_exposure|money }}/{{ detail.risk_check.max_total_exposure_usd|money }}</span></div>
+    <div><span class="label">Result</span><span class="badge {% if detail.risk_check.result == 'APPROVED' %}badge-positive{% else %}badge-warning{% endif %}">{{ detail.risk_check.result }}</span></div>
+  </div>
+</div>
+
+<div class="detail-block">
+  <h4>Evidence</h4>
+  {% if detail.evidence %}
+    {% for item in detail.evidence %}
+    <div class="evidence-item">
+      <div class="evidence-source">{{ item.source }}</div>
+      <div>{{ item.content }}</div>
+    </div>
+    {% endfor %}
+  {% else %}
+    <div class="empty-state">No evidence items stored for this decision.</div>
+  {% endif %}
+</div>
+
+<div class="detail-block">
+  <h4>{% if detail.llm_model_used %}LLM Reasoning{% else %}Strategy Reasoning{% endif %}</h4>
+  <pre class="thinking-block">{{ detail.thinking }}</pre>
+  {% if detail.no_action_reason %}
+  <div class="muted"><strong>No action reason:</strong> {{ detail.no_action_reason }}</div>
+  {% endif %}
+</div>
+
+<div class="detail-block">
+  <h4>Execution</h4>
+  {% if detail.executions %}
+  <table class="data-table compact">
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th class="num">Fill</th>
+        <th class="num">Slippage</th>
+        <th class="num">Fees</th>
+        <th class="num">Total Cost</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in detail.executions %}
+      <tr>
+        <td title="{{ item.timestamp|timestamp }}">{{ item.timestamp|relative_time }}</td>
+        <td class="num mono">{{ item.fill_price|num }}</td>
+        <td class="num mono">{{ item.slippage_applied|num }}</td>
+        <td class="num mono">{{ item.fees_applied|money }}</td>
+        <td class="num mono">{{ item.total_cost|money }}</td>
+        <td>{{ item.status }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty-state">No execution rows recorded for this decision.</div>
+  {% endif %}
+</div>
+{% endif %}
+

@@ -1,0 +1,54 @@
+<div id="positions-page" class="page" hx-get="/api/positions" hx-trigger="every 30s" hx-swap="outerHTML">
+  <section class="card">
+    <div class="section-title">Live Positions</div>
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Market</th>
+          <th>Question</th>
+          <th>Side</th>
+          <th class="num">Entry</th>
+          <th class="num">Current</th>
+          <th class="num">Size</th>
+          <th class="num">Unrealized</th>
+          <th>Strategy</th>
+          <th>Opened</th>
+          <th>Resolves</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in content.positions %}
+        <tr class="{{ row.status_class }}">
+          <td class="mono">{{ row.market_id }}</td>
+          <td title="{{ row.question }}">{{ row.question[:74] }}{% if row.question|length > 74 %}…{% endif %}</td>
+          <td>{{ row.side }} {{ row.outcome_label }}</td>
+          <td class="num mono">{{ row.entry_price|num }}</td>
+          <td class="num mono">{{ row.current_price|num }}</td>
+          <td class="num mono">{{ row.size_usd|money }}</td>
+          <td class="num mono {% if row.unrealized_pnl > 0 %}positive{% elif row.unrealized_pnl < 0 %}negative{% endif %}">{{ row.unrealized_pnl|money }}</td>
+          <td>{{ row.strategy_id }}</td>
+          <td title="{{ row.opened_at|timestamp }}">{{ row.opened_at|relative_time }}</td>
+          <td title="{{ row.resolves_at|timestamp if row.resolves_at else 'n/a' }}">{{ row.resolves_at|relative_time if row.resolves_at else "n/a" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <div class="summary-strip">
+      <span>Total open positions: <strong>{{ content.summary.count }}</strong></span>
+      <span>Total exposure: <strong class="mono">{{ content.summary.total_exposure|money }}</strong></span>
+      <span>Net unrealized P&amp;L: <strong class="mono {% if content.summary.net_unrealized_pnl > 0 %}positive{% elif content.summary.net_unrealized_pnl < 0 %}negative{% endif %}">{{ content.summary.net_unrealized_pnl|money }}</strong></span>
+      <span style="margin-left:auto">
+        <button id="reset-btn"
+                hx-post="/api/reset-paper-trading"
+                hx-confirm="Reset ALL paper trading? This closes all positions and resets balances to $10,000."
+                hx-swap="none"
+                hx-on::after-request="if(event.detail.successful){document.getElementById('reset-msg').textContent='Reset complete. Refreshing...';setTimeout(()=>location.reload(),1000)}else{document.getElementById('reset-msg').textContent='Reset failed: '+event.detail.xhr.responseText}"
+                style="background:var(--red);color:#fff;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600">
+          Reset Paper Trading
+        </button>
+        <span id="reset-msg" style="margin-left:8px;font-size:12px;color:var(--muted)"></span>
+      </span>
+    </div>
+  </section>
+</div>
+

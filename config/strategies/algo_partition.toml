@@ -1,0 +1,22 @@
+[strategy]
+id = "algo_partition"
+name = "Partition Arbitrage"
+type = "algo"
+enabled = true
+starting_balance = 10000.0
+
+[strategy.schedule]
+cadence_minutes = 60
+
+[strategy.scope]
+categories = ["weather"]
+supported_formats = ["numeric_bracket"]
+venues = ["polymarket", "kalshi"]
+min_volume_usd = 1000
+min_time_remaining_hours = 1
+
+[strategy.risk]
+max_position_pct = 0.10
+max_positions = 12
+max_daily_loss_pct = 0.10
+min_edge_bps = 200

@@ -1,0 +1,24 @@
+{
+  "blockedDomains": [
+    "merriam-webster.com",
+    "dictionary.com",
+    "dictionary.cambridge.org",
+    "wordreference.com",
+    "wiktionary.org",
+    "realtor.com",
+    "zillow.com",
+    "city-data.com",
+    "forums.att.com",
+    "mclibre.org",
+    "thesaurus.com",
+    "vocabulary.com",
+    "yourdictionary.com",
+    "collinsdictionary.com",
+    "lexico.com"
+  ],
+  "minSnippetLength": 20,
+  "blockNonLatinThreshold": 0.5,
+  "minRelevanceScore": 0.35,
+  "maxSourcesForSynthesis": 50,
+  "contentExtractionTopN": 10
+}

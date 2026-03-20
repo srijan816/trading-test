@@ -1,0 +1,157 @@
+# Decisions
+
+This file records architecture and implementation decisions as they exist in the current codebase. When git history is available, entries should cite the actual change set; in this workspace, the repository history was not available, so the notes below are summarized from the checked-in code state on 2026-03-20.
+
+## 2026-03-20 — FIX 1: Settlement pipeline now resolves weather markets locally
+Changed: `src/arena/main.py` (`poll_resolutions`)
+What: `poll_resolutions()` now queries both `status='active'` AND `status='resolved'` markets with `end_time < now()`. Weather markets are resolved locally using observed temperatures from `station_observations.py` + `CITY_COORDS`, comparing actual highs against contract thresholds. Non-weather markets still use Polymarket/Kalshi API. Markets overdue by 24h+ without API resolution are logged as warnings. Settlement fires the existing calibration hook (`resolution_hook.py`).
+Status: Working.
+Next: Grow resolved sample size; monitor city-level calibration drift.
+
+## 2026-03-20 — FIX 2: Categorization rewrite with scoring system
+Changed: `src/arena/categorization.py`, `src/arena/db.py`, `scripts/recategorize_markets.py`
+What: Replaced first-match keyword lookup with a scoring system that counts keyword hits per category and picks the highest scorer. Added 9 expanded keyword dictionaries (150+ sports terms including team names, prop-bet regex patterns), `secondary_category` column, and `categorize_market_detailed()` returning `(primary, secondary)`. Created `scripts/recategorize_markets.py` for batch re-categorization with before/after distribution reporting.
+Status: Working.
+Next: Monitor categorization accuracy on new market ingestion.
+
+## 2026-03-20 — FIX 3: Research enabled for LLM Analyst strategy
+Changed: `config/strategies/llm_analyst.toml`
+What: Set `search.enabled = true`, added `research_assistant_enabled = true` and `research_mode = "standard"`. The LLM Analyst now calls Nexus/Perplexia research for weather markets, incorporating ensemble data into the synthesis layer.
+Status: Working.
+Next: Monitor research log entries and Nexus call volume.
+
+## 2026-03-20 — MiniMax direct synthesis fix
+Changed: `services/nexus/src/lib/minimax-client.ts` (new), `services/nexus/src/market-research.ts`  
+What: Direct MiniMax API bypasses OpenAI SDK parsing bug.  
+Status: Working. Live test confirmed.  
+Next: Add reasoning trace capture.
+
+## 2026-03-20 — Research Pipeline dashboard
+Changed: `src/arena/dashboard/app.py`, `src/arena/dashboard/queries.py`, research templates  
+What: New `/research-pipeline` page, `research_log` table, live logging.  
+Status: Working. Integrated in nav.
+
+## 2026-03-20 — System audit
+What: Full diagnostic found 5 critical, 8 high, 7 medium issues.  
+Status: Fixes in progress.
+
+## 2026-03-20 — Structured market research moved behind Nexus
+Changed: `src/arena/intelligence/research.py`, `src/arena/intelligence/info_packet.py`, `services/nexus/src/market-research.ts`  
+What: Arena now sends a structured market payload to Nexus instead of relying only on ad hoc search summaries. The response includes probability, confidence, edge assessment, sources, and model metadata.  
+Status: Working for the main research path.  
+Next: Keep Python and TypeScript response types aligned.
+
+## 2026-03-20 — Weather ensemble anchored the weather research path
+Changed: `src/arena/data_sources/weather_ensemble.py`, `src/arena/intelligence/info_packet.py`, `services/nexus/src/market-research.ts`  
+What: Weather markets pass ensemble mean/sigma/threshold context into Nexus, and the synthesis layer clamps large deviations back toward the ensemble probability.  
+Status: Working with override protection enabled.  
+Next: Continue validating calibration against resolved weather markets.
+
+## 2026-03-20 — Settlement now feeds calibration scoring
+Changed: `src/arena/engine/settlement.py`, `src/arena/calibration/resolution_hook.py`, `src/arena/calibration/crps_tracker.py`  
+What: Settlement hooks compute real resolved outcomes and feed both Brier scoring and weather-market CRPS tracking.  
+Status: Working after resolution metadata fixes.  
+Next: Grow the resolved sample size and watch city-level sigma recommendations.
+
+## 2026-03-20 — Duplicate dashboard/weather constants were consolidated
+Changed: `src/arena/dashboard/queries.py`, `src/arena/data_sources/weather_constants.py`, `src/arena/data_sources/weather_ensemble.py`  
+What: Canonical weather bias values were moved to a shared source so the dashboard and ensemble layer stop drifting.  
+Status: Working.  
+Next: Keep any future station/source-specific adjustments in the shared constants module.
+
+## 2026-03-20 — Tavily path retired in favor of Nexus/Perplexia
+Changed: `src/arena/main.py`, strategy configs, search adapter wiring
+What: The old Tavily search path was removed so Arena consistently uses the Nexus/Perplexia research stack.
+Status: Working.
+Next: Remove any stale operational docs that still mention Tavily.
+
+## 2026-03-20 — Market format classification + strategy filtering
+Changed: `src/arena/categorization.py`, `src/arena/db.py`, `src/arena/strategies/base.py`, `src/arena/strategies/algo_forecast.py`, `src/arena/strategies/algo_harvester.py`, `src/arena/strategies/algo_partition.py`, `src/arena/strategies/llm_strategy.py`, `src/arena/intelligence/info_packet.py`, `scripts/recategorize_markets.py`, all strategy TOML configs
+What: Added `detect_market_format()` returning binary/multi_outcome/numeric_bracket/unknown. Added `market_format TEXT` column via migration. Multi-outcome format heuristic (3+ comma-separated yes/no items) now infers sports category, reducing uncategorized "event" markets from 1401 to 102 (99.7% categorized). Crypto disambiguation logic fixes "Solana Sierra" and "COL Avalanche" false positives (crypto 17→4). Strategy base class gains `supported_formats` and `supported_categories` with `is_market_eligible()` gate. No strategy supports `multi_outcome`. Strategy configs updated: llm_news_trader fixed mismatched category names (events→event, regulation→legal, tech→science_tech), algo_harvester scoped to politics/entertainment/legal/sports, algo_partition scoped to weather only. Info packet builder also filters by `supported_formats`.
+Status: Working. All py_compile checks pass.
+Next: Monitor remaining 102 "event" markets; consider LLM-based fallback for truly ambiguous questions.
+
+## 2026-03-20 — FIX: Settlement pipeline activated and hardened
+Changed: `src/arena/engine/settlement.py`, `src/arena/main.py`
+What: Settlement pipeline was registered in the scheduler but never produced results because weather observation failures were silently swallowed. Added per-market try/except error handling with `settled_count`/`skipped_count`/`error_count` tracking, `settlement_error` event logging on failure, and a summary log line. Added `market_settled` event recording in `SettlementEngine.settle_market()` with market_id, venue, winning outcome, positions settled count, total realized PnL, PnL by strategy, and resolution source. Manual trigger confirmed: 121 markets settled, 64 skipped, 0 errors.
+Status: Working. 121 resolutions and 121 `market_settled` events recorded.
+Next: Monitor ongoing settlement cycles and grow resolved sample size.
+
+## 2026-03-20 — FIX: Central Kelly sizing enforcement in execute_decision
+Changed: `src/arena/main.py`
+What: The `llm_analyst` placed a $100.50 position (1415 shares × $0.071) on a 7% probability market, bypassing the $50 RISK_MAX_SINGLE_TRADE_SIZE cap. Root cause: individual strategies ran their own Kelly sizing but `execute_decision()` had no central enforcement. Added a single enforcement point in `execute_decision()` that ALL strategies pass through — recomputes `compute_position_size()` from scratch using orderbook ask price, applies the full Kelly chain (raw → half_kelly → capped → extreme prob reduction), and enforces a hard dollar cap via `RISK_MAX_SINGLE_TRADE_SIZE`. Logs a `trade_sizing` event with the full chain for every trade. The $100.50 trade scenario now returns "no_trade: no edge" (7% prob vs 7.1% ask).
+Status: Working. All py_compile checks pass.
+Next: Monitor `trade_sizing` events to confirm all trades are properly sized.
+
+## 2026-03-20 — FIX: Dashboard reset button for paper trading
+Changed: `src/arena/engine/paper_reset.py` (new), `src/arena/dashboard/app.py`, `src/arena/dashboard/templates/partials/positions_page.html`
+What: Extracted reset logic from `scripts/reset_paper_trading.py` into a reusable `reset_paper_trading()` function in `src/arena/engine/paper_reset.py`. Added `POST /api/reset-paper-trading` endpoint to the dashboard. Added a red "Reset Paper Trading" button in the positions page summary strip with HTMX confirm dialog. Reset closes open positions (status='reset_cancelled'), cancels pending orders, resets all portfolios to $10,000, backs up state files, and records a `paper_reset` event.
+Status: Working. Test confirmed: 1 position closed, all balances reset to $10,000.
+Next: Consider adding a reset history view to the dashboard.
+
+## 2026-03-20 — FIX 5-pipeline: Research pipeline, CRPS calibration, settlement logging, env vars, algo_partition edge
+Changed: `src/arena/intelligence/rate_limiter.py`, `src/arena/intelligence/info_packet.py`, `src/arena/calibration/crps_tracker.py`, `src/arena/calibration/resolution_hook.py`, `src/arena/engine/settlement.py`, `src/arena/strategies/algo_partition.py`, `.env`, `.env.example`
+
+What:
+1. **Research pipeline**: `NexusRateLimiter` is now configurable via `NEXUS_RATE_LIMIT_CALLS` (20), `NEXUS_RATE_LIMIT_WINDOW_SECONDS` (1800), `NEXUS_COOLDOWN_RESET_MINUTES` (5). Added `is_in_cooldown()`, `set_cooldown()`, `cooldown_expires_in()` methods. After a Nexus error, cooldown is set for 5 minutes (configurable), then auto-resets so the next scan cycle retries. `_should_search()` now returns a tuple `(should_search, reason)` and logs `research_call_attempted` / `research_call_blocked` events to the events table with reason tags: `search_disabled`, `cooldown`, `rate_limit`, `trigger_conditions_not_met`. `_maybe_research_market()` removed the instance-level `_research_assistant_available` flag; cooldown is now solely managed by the module-level rate limiter. Build() no longer double-calls `_should_search()` for the same market.
+
+2. **CRPS calibration**: `parameter_adjustments` table uses `current_value`/`recommended_value` column names (verified correct in both DB schema and hook INSERT). Added try/except around the INSERT with error logging so silent failures no longer go unnoticed. CRPS `record()` now deduplicates: skips insert if an identical record (same city, target_date, mu±0.01, sigma±0.01) exists in the last hour.
+
+3. **Settlement**: `settle_market()` now fetches all open positions into a list first and logs `found N total open positions, filtering for market match...` plus uses `str()` coercion on both sides of the market_id/venue comparison to prevent type-mismatch silent failures.
+
+4. **Env vars**: Added to `.env`: `RISK_MAX_SINGLE_TRADE_SIZE=50`, `RISK_KELLY_FRACTION_MULTIPLIER=0.25`, `RISK_MIN_TRADE_SIZE=5`, `RISK_REENTRY_PRICE_DELTA_CENTS=5`, `RISK_MAX_EXPOSURE_PER_MARKET=75`, `RISK_MAX_POSITIONS_PER_MARKET=2`, `NEXUS_RATE_LIMIT_CALLS=20`, `NEXUS_RATE_LIMIT_WINDOW_SECONDS=1800`, `NEXUS_COOLDOWN_RESET_MINUTES=5`. Also added to `.env.example` with explanatory comments.
+
+5. **algo_partition edge**: HOLD decisions now report `expected_edge_bps = 0` instead of the computed deviation value. Only BUY decisions carry a non-zero edge.
+
+Status: All py_compile checks pass. All diagnostic queries confirmed.
+
+## 2026-03-20 — FIX 6-pipeline-2: Research pipeline, env loading, execution gates, CRPS feedback loop, restart script
+Changed: `src/arena/env.py`, `src/arena/intelligence/rate_limiter.py`, `src/arena/intelligence/info_packet.py`, `src/arena/main.py`, `src/arena/dashboard/app.py`, `src/arena/data_sources/weather_ensemble.py`, `src/arena/calibration/resolution_hook.py`, `config/strategies/algo_forecast.toml`, `src/arena/scripts/run_burnin.sh`, `scripts/restart_arena.sh` (new)
+
+What:
+1. **Env loading**: `load_local_env()` now uses `setdefault` (was overwriting) so uvicorn-launched processes don't override with blank values. Added belt-and-suspenders `load_local_env()` call to `src/arena/dashboard/app.py` before all other imports.
+
+2. **NexusRateLimiter** env vars: Moved `NEXUS_RATE_LIMIT_CALLS`, `NEXUS_RATE_LIMIT_WINDOW_SECONDS`, `NEXUS_COOLDOWN_RESET_MINUTES` from class-level attributes (read at import time) to module-level getter functions `_max_calls()`, `_window_seconds()`, `_cooldown_minutes()` that are called at runtime. This ensures that when the scheduler process starts fresh, `load_local_env()` has already set the env vars before any research cycle runs.
+
+3. **Missing `_research_assistant_available`**: `InfoPacketBuilder.__init__` now initializes `self._research_assistant_available = True`. Without this, the attribute was referenced in `build()` but never set, causing `AttributeError` on every info packet build.
+
+4. **algo_forecast research**: Added `[strategy.search]` section to `algo_forecast.toml` with `enabled=true`, `max_searches_per_cycle=3`, `trigger_conditions=["always"]`, `research_assistant_enabled=true`. Previously this section was entirely absent, making `search_budget = 0` and disabling all research calls for the most active strategy.
+
+5. **llm_analyst trigger_conditions**: Changed from `["near_resolution", "high_volatility"]` to `["always"]` so research is attempted on every cycle (not blocked by trigger conditions).
+
+6. **Execution gate logging**: Added 6 structured gate-level event logs to `execute_decision()` replacing opaque `execution_skip` events: `execution_gate_market_active` (gate 1), `execution_gate_risk_approval` (gate 2), `execution_gate_orderbook` (gate 3), `execution_gate_reentry` (gate 4), `execution_gate_spread_filter` (gate 5), `execution_gate_kelly_sizing` (gate 6). Each includes strategy_id, market_id, outcome_id, venue, pass/fail, and gate-specific details (spread value, risk reason, Kelly computed size, etc.).
+
+7. **CRPS feedback loop**: `weather_ensemble.py` now reads `parameter_adjustments` table via `_load_sigma_adjustment_from_db()` at the start of `get_ensemble_forecast()`. If a valid `ensemble_sigma` adjustment exists for the city, it overrides `sigma_mult`. This closes the feedback loop — adjustments written to the DB by `resolution_hook` are now consumed by forecast computation.
+
+8. **restart_arena.sh**: New script at `scripts/restart_arena.sh` that kills the dashboard (port 8050) and scheduler processes, waits 2s, sources `.env`, then restarts both processes with stdout/stderr redirected to `/tmp/arena-dashboard.log` and `/tmp/arena-scheduler.log`. Made executable.
+
+9. **run_burnin.sh**: Added `set -a; source .env; set +a` before starting the scheduler so all env vars are available in the burn-in loop.
+
+Status: All py_compile checks pass. Diagnostic queries confirmed RISK_KELLY_FRACTION_MULTIPLIER=0.25, RISK_MAX_SINGLE_TRADE_SIZE=50, NEXUS_RATE_LIMIT_CALLS=20 all loaded. 147 parameter_adjustments exist in DB (confirming INSERT works). research_log has 2 entries (stale from before fix — new research calls should start after restart). execution_skip analysis shows: 14 stale Polymarket orderbooks (algo_partition), 8 daily loss limit hits (algo_harvester/llm_analyst), 2 spread filter rejections — no execution bugs, just business logic gates. Settlement shows 121 markets settled with 0 positions_settled — no open positions overlap with settling markets (Ankara weather markets have no positions; system traded Chicago/London). Parameter adjustments INSERT confirmed working (147 rows). NexusRateLimiter now reads env vars at call time, ensuring fresh scheduler processes use .env values.
+
+
+## 2026-03-20 — FIX 6-pipeline: Env loading, research pipeline, restart script, gate logging, CRPS feedback
+
+Changed: `src/arena/env.py`, `src/arena/intelligence/rate_limiter.py`, `src/arena/intelligence/info_packet.py`, `src/arena/dashboard/app.py`, `src/arena/main.py`, `src/arena/data_sources/weather_ensemble.py`, `config/strategies/algo_forecast.toml`, `config/strategies/llm_analyst.toml`, `scripts/restart_arena.sh`, `src/arena/scripts/run_burnin.sh`
+
+What:
+
+1. **Env loading**: `load_local_env()` already parses `.env` via `os.environ.setdefault`. The real fix was ensuring `NexusRateLimiter` reads env vars at **call time** (via module-level accessor functions) rather than at class-definition or instantiation time. Also added missing `_research_assistant_available = True` to `InfoPacketBuilder.__init__`.
+
+2. **Research pipeline**: `algo_forecast.toml` was missing the `[strategy.search]` section entirely — `max_searches_per_cycle = 0` → no research ever called. Added the full `[strategy.search]` section with `enabled = true`, `max_searches_per_cycle = 3`, `trigger_conditions = ["always"]`, `research_assistant_enabled = true`, `research_mode = "standard"`. Also changed `llm_analyst.toml` `trigger_conditions` from `["near_resolution", "high_volatility"]` to `["always"]` so research fires on every cycle. `algo_harvester` and `algo_partition` intentionally have no research (algorithmic-only).
+
+3. **Restart script**: Created `scripts/restart_arena.sh` (executable) that kills the uvicorn dashboard (port 8050) and scheduler processes, waits 2s, sources `.env`, then restarts both with output redirected to `/tmp/arena-dashboard.log` and `/tmp/arena-scheduler.log`. Updated `run_burnin.sh` to `source .env` before starting the scheduler.
+
+4. **Dashboard env**: Added `load_local_env()` call to top of `src/arena/dashboard/app.py` so the uvicorn process also loads env vars.
+
+5. **Gate-level execution logging**: Added 6 new event types in `execute_decision()` for precise visibility into where trades die:
+   - `execution_gate_market_active`: pass/fail + market status
+   - `execution_gate_risk_approval`: pass/fail + reason
+   - `execution_gate_orderbook`: pass/fail + best_bid, best_ask, spread, error
+   - `execution_gate_spread_filter`: pass/fail + spread_value, threshold, bid, ask
+   - `execution_gate_reentry`: pass/fail + price_delta, threshold
+   - `execution_gate_kelly_sizing`: pass/fail + computed_size, min_threshold, hard_cap, reason
+
+6. **CRPS feedback loop**: `weather_ensemble.py` now calls `_load_sigma_adjustment_from_db()` at the start of forecast computation to read the most recent `ensemble_sigma` adjustment from the `parameter_adjustments` table and apply it as the sigma multiplier. This closes the loop so calibration suggestions written by `resolution_hook.py` are actually consumed. Falls back to the static `sigma_calibration.json` if no DB adjustment exists.
+
+Status: All py_compile checks pass.

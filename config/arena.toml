@@ -1,0 +1,59 @@
+[arena]
+name = "Arena"
+timezone = "UTC"
+db_path = "data/arena.db"
+stop_file = "config/STOP"
+extra_slippage_bps = 50
+stale_market_minutes = 10
+default_starting_balance = 1000.0
+
+[scheduler]
+scan_markets_minutes = 30
+poll_resolutions_minutes = 30
+mark_to_market_minutes = 15
+export_dashboard_minutes = 15
+check_manual_responses_minutes = 30
+daily_snapshot_cron = "59 23 * * *"
+weekly_retrospective_cron = "0 6 * * 0"
+monthly_meta_cron = "0 6 1 * *"
+
+[venues.polymarket]
+enabled = true
+gamma_base_url = "https://gamma-api.polymarket.com"
+clob_base_url = "https://clob.polymarket.com"
+
+[venues.kalshi]
+enabled = true
+base_url = "https://api.elections.kalshi.com/trade-api/v2"
+
+[fees]
+default_weather_bps = 200
+default_crypto_bps = 100
+default_event_bps = 100
+default_economics_bps = 100
+
+[reports]
+directory = "reports"
+
+[manual]
+pending_dir = "prompts/pending"
+responses_dir = "prompts/responses"
+
+[execution]
+mode = "paper"  # "paper" or "live" — live requires ARENA_LIVE_TRADING env var
+
+[risk]
+max_daily_trades = 20
+max_daily_loss_usd = 50.0
+max_open_positions = 10
+max_exposure_per_market_usd = 50.0
+max_total_exposure_usd = 200.0
+cooldown_after_loss_streak = 3
+cooldown_minutes = 60
+
+[position_sizing]
+kelly_fraction = 0.25
+max_position_pct = 0.02
+min_position_usd = 1.0
+max_position_usd = 25.0
+fee_rate = 0.02

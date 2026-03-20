@@ -1,0 +1,94 @@
+{% if detail %}
+<div class="detail-header">
+  <div>
+    <div class="section-title">Research Detail</div>
+    <div class="muted">{{ detail.strategy }} · {{ detail.endpoint }} · {{ detail.timestamp|timestamp }}</div>
+  </div>
+  <div>
+    <span class="badge {% if detail.error %}badge-negative{% elif detail.from_cache %}badge-warning{% else %}badge-positive{% endif %}">
+      {% if detail.error %}error{% elif detail.from_cache %}cache{% else %}ok{% endif %}
+    </span>
+    {% if detail.reset_boundary == "post-reset" %}
+    <span class="badge badge-positive">post-reset</span>
+    {% elif detail.reset_boundary == "pre-reset" %}
+    <span class="badge badge-warning">pre-reset</span>
+    {% endif %}
+  </div>
+</div>
+
+<div class="kv-grid">
+  <div><span class="label">Market</span><span>{{ detail.market_question or detail.market_id or "n/a" }}</span></div>
+  <div><span class="label">Strategy</span><span>{{ detail.strategy }}</span></div>
+  <div><span class="label">Model</span><span class="mono">{{ detail.model_used or "unknown" }}</span></div>
+  <div><span class="label">Mode</span><span class="mono">{{ detail.mode or "n/a" }}</span></div>
+  <div><span class="label">Duration</span><span class="mono">{% if detail.duration_ms is not none %}{{ detail.duration_ms|intcomma }} ms{% else %}n/a{% endif %}</span></div>
+  <div><span class="label">Sources</span><span class="mono">{{ detail.sources_count|intcomma }}</span></div>
+  <div><span class="label">Probability</span><span class="mono">{% if detail.probability is not none %}{{ detail.probability|pct }}{% else %}n/a{% endif %}</span></div>
+  <div><span class="label">Confidence</span><span>{{ detail.confidence or "n/a" }}</span></div>
+  <div><span class="label">From Cache</span><span>{{ "Yes" if detail.from_cache else "No" }}</span></div>
+  <div><span class="label">Used In Decision</span><span>{{ "Yes" if detail.used_in_decision else "No" }}</span></div>
+</div>
+
+<div class="detail-block">
+  <h4>Query Sent</h4>
+  <pre class="thinking-block">{{ detail.query_sent }}</pre>
+</div>
+
+{% if detail.error %}
+<div class="detail-block">
+  <h4>Error</h4>
+  <pre class="thinking-block">{{ detail.error }}</pre>
+</div>
+{% endif %}
+
+{% if detail.edge_assessment %}
+<div class="detail-block">
+  <h4>Edge Assessment</h4>
+  <pre class="thinking-block">{{ detail.edge_assessment | tojson(indent=2) }}</pre>
+</div>
+{% endif %}
+
+<div class="detail-block">
+  <h4>Report</h4>
+  <pre class="thinking-block">{{ detail.full_report or detail.report_summary or "n/a" }}</pre>
+</div>
+
+{% if detail.reasoning_trace %}
+<div class="detail-block">
+  <details>
+    <summary>Model Reasoning Trace (click to expand)</summary>
+    <pre style="background: #f7f7f8; color: #222; font-size: 0.85rem; line-height: 1.45; padding: 0.9rem; border-radius: 10px; border: 1px solid rgba(15, 23, 42, 0.08); max-height: 22rem; overflow: auto; white-space: pre-wrap;">{{ detail.reasoning_trace }}</pre>
+  </details>
+</div>
+{% endif %}
+
+<div class="detail-block">
+  <h4>Sources</h4>
+  {% if detail.sources %}
+  <div class="evidence-list">
+    {% for source in detail.sources %}
+    <div class="evidence-item">
+      <div class="evidence-source">
+        {% if source.url %}
+        <a href="{{ source.url }}" target="_blank" rel="noopener noreferrer">{{ source.title or source.url or "Untitled source" }}</a>
+        {% else %}
+        {{ source.title or "Untitled source" }}
+        {% endif %}
+      </div>
+      <div class="muted">
+        {% if source.url %}
+        <a href="{{ source.url }}" target="_blank" rel="noopener noreferrer">{{ source.url }}</a>
+        {% else %}
+        n/a
+        {% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state">No sources captured for this row.</div>
+  {% endif %}
+</div>
+{% else %}
+<div class="empty-state">Research row not found.</div>
+{% endif %}

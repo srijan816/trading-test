@@ -1,0 +1,79 @@
+<div id="decision-log-page"
+     class="page"
+     hx-get="/api/decisions"
+     hx-trigger="every 30s"
+     hx-include="#decision-filters"
+     hx-swap="outerHTML">
+  <section class="card">
+    <div class="section-title">Decision Log</div>
+    <form id="decision-filters"
+          class="filters"
+          hx-get="/api/decisions"
+          hx-target="#decision-log-page"
+          hx-swap="outerHTML">
+      <label>
+        <span>Strategy</span>
+        <select name="strategy">
+          {% for option in content.strategy_options %}
+          <option value="{{ option }}" {% if option == content.filters.strategy %}selected{% endif %}>{{ option }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        <span>Action</span>
+        <select name="action_filter">
+          {% for option in ["all", "trades", "no-action", "errors"] %}
+          <option value="{{ option }}" {% if option == content.filters.action_filter %}selected{% endif %}>{{ option }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        <span>Date Range</span>
+        <select name="date_range">
+          {% for value, label in [("today", "Today"), ("last3", "Last 3 Days"), ("last7", "Last 7 Days"), ("all", "All")] %}
+          <option value="{{ value }}" {% if value == content.filters.date_range %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+    </form>
+    <div class="decision-layout">
+      <div class="decision-table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Strategy</th>
+              <th>Action</th>
+              <th>Market</th>
+              <th class="num">Prob</th>
+              <th class="num">Edge</th>
+              <th class="num">Amount</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in content.decisions %}
+            <tr class="clickable {{ row.status }}"
+                hx-get="/api/decision/{{ row.decision_id }}"
+                hx-target="#decision-detail"
+                hx-swap="innerHTML">
+              <td title="{{ row.timestamp|timestamp }}">{{ row.timestamp|relative_time }}</td>
+              <td>{{ row.strategy_id }}</td>
+              <td>{{ row.action_label }}</td>
+              <td title="{{ row.market_question }}">{{ row.market_question[:68] }}{% if row.market_question|length > 68 %}…{% endif %}</td>
+              <td class="num mono">{{ row.predicted_probability|pct }}</td>
+              <td class="num mono">{{ row.expected_edge_bps|bps }}</td>
+              <td class="num mono">{{ row.amount_usd|money }}</td>
+              <td><span class="badge {% if row.status == 'trade' %}badge-positive{% elif row.status == 'error' %}badge-negative{% elif row.status == 'skip' %}badge-warning{% else %}badge-neutral{% endif %}">{{ row.status }}</span></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <aside id="decision-detail" class="card decision-detail">
+        <div class="empty-state">Click a decision row to inspect the full reasoning chain, evidence, sizing, risk checks, and execution detail.</div>
+      </aside>
+    </div>
+  </section>
+</div>
+

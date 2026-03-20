@@ -1,0 +1,94 @@
+<div id="health-page" class="page" hx-get="/api/health" hx-trigger="every 30s" hx-swap="outerHTML">
+  <section class="card">
+    <div class="section-title">Process Status</div>
+    <div class="metric-grid metric-grid-wide">
+      <div><div class="metric-label">Burn-in PID</div><div class="metric-value mono {% if content.process.pid_info.alive %}positive{% else %}negative{% endif %}">{{ content.process.pid_info.pid or "n/a" }}</div></div>
+      <div><div class="metric-label">Status</div><div class="metric-value">{{ "alive" if content.process.pid_info.alive else "dead" }}</div></div>
+      <div><div class="metric-label">Uptime</div><div class="metric-value mono">{{ content.process.pid_info.uptime }}</div></div>
+      <div><div class="metric-label">Last Decision</div><div class="metric-value" title="{{ content.process.last_decision_at|timestamp if content.process.last_decision_at else 'n/a' }}">{{ content.process.last_decision_at|relative_time if content.process.last_decision_at else "n/a" }}</div></div>
+      <div><div class="metric-label">Last Market Scan</div><div class="metric-value" title="{{ content.process.last_scan_at|timestamp if content.process.last_scan_at else 'n/a' }}">{{ content.process.last_scan_at|relative_time if content.process.last_scan_at else "n/a" }}</div></div>
+      <div><div class="metric-label">Last Settlement</div><div class="metric-value" title="{{ content.process.last_settlement_at|timestamp if content.process.last_settlement_at else 'n/a' }}">{{ content.process.last_settlement_at|relative_time if content.process.last_settlement_at else "n/a" }}</div></div>
+    </div>
+    <div class="log-line"><span class="label">Last log line</span><span class="mono">{{ content.process.last_log_line or "n/a" }}</span></div>
+  </section>
+
+  <section class="card">
+    <div class="section-title">Error Log</div>
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Strategy</th>
+          <th>Event Type</th>
+          <th>Payload</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% if content.errors %}
+          {% for row in content.errors %}
+          <tr>
+            <td title="{{ row.time|timestamp }}">{{ row.time|relative_time }}</td>
+            <td>{{ row.strategy_id or "system" }}</td>
+            <td>{{ row.event_type }}</td>
+            <td class="mono">{{ row.payload }}</td>
+          </tr>
+          {% endfor %}
+        {% else %}
+          <tr><td colspan="4" class="empty-state">No error events recorded.</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </section>
+
+  <section class="two-col">
+    <article class="card">
+      <div class="section-title">Database Stats</div>
+      <table class="data-table compact">
+        <thead>
+          <tr>
+            <th>Table</th>
+            <th class="num">Row Count</th>
+            <th>Last Updated</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in content.db_stats %}
+          <tr>
+            <td>{{ row.table }}</td>
+            <td class="num mono">{{ row.rows|intcomma }}</td>
+            <td title="{{ row.last_updated|timestamp if row.last_updated else 'n/a' }}">{{ row.last_updated|relative_time if row.last_updated else "n/a" }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </article>
+
+    <article class="card">
+      <div class="section-title">API Provider Status</div>
+      <table class="data-table compact">
+        <thead>
+          <tr>
+            <th>Provider</th>
+            <th>Last Success</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for provider, timestamp in content.provider_status.items() %}
+          <tr>
+            <td>{{ provider }}</td>
+            <td title="{{ timestamp|timestamp if timestamp else 'n/a' }}">{{ timestamp|relative_time if timestamp else "n/a" }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </article>
+  </section>
+
+  <section class="card">
+    <div class="section-title">Log Viewer</div>
+    <div hx-get="/api/health/logs" hx-trigger="load, every 10s" hx-target="this" hx-swap="innerHTML">
+      {% include "partials/health_log_viewer.html" %}
+    </div>
+  </section>
+</div>
+
