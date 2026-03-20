@@ -920,6 +920,7 @@ async def monitor_limit_orders(
 ) -> None:
     updates = await execution_services.limit_order_manager.monitor_orders()
     replacements = await execution_services.limit_order_manager.reprice_stale_orders()
+    metrics = _limit_order_metrics(db)
     if updates:
         db.record_event(
             "limit_order_monitor_cycle",
@@ -936,6 +937,7 @@ async def monitor_limit_orders(
                     for update in updates
                 ],
                 "replacement_count": len(replacements),
+                "metrics": metrics,
             },
         )
     elif replacements:
@@ -944,14 +946,54 @@ async def monitor_limit_orders(
             {
                 "updates": [],
                 "replacement_count": len(replacements),
+                "metrics": metrics,
             },
         )
     if updates or replacements:
         logger.info(
-            "limit order monitor: %d updates, %d reprices",
+            "limit order monitor: %d updates, %d reprices, fill_rate=%s avg_fill_seconds=%s avg_midpoint_slippage_cents=%s",
             len(updates),
             len(replacements),
+            metrics.get("fill_rate"),
+            metrics.get("avg_time_to_fill_seconds"),
+            metrics.get("avg_midpoint_slippage_cents"),
         )
+
+
+def _limit_order_metrics(db: ArenaDB, lookback_hours: int = 24) -> dict[str, float | int | None]:
+    with db.connect() as conn:
+        rows = list(
+            conn.execute(
+                """
+                SELECT status, placed_at, filled_at, fill_price, metadata_json
+                FROM limit_orders
+                WHERE updated_at >= datetime('now', ?)
+                """,
+                (f"-{int(lookback_hours)} hours",),
+            )
+        )
+    closed_rows = [row for row in rows if str(row["status"]).lower() in {"filled", "cancelled", "expired", "rejected"}]
+    filled_rows = [row for row in rows if str(row["status"]).lower() == "filled"]
+    fill_rate = (len(filled_rows) / len(closed_rows)) if closed_rows else None
+    fill_durations = []
+    midpoint_slippages = []
+    for row in filled_rows:
+        placed_at = datetime.fromisoformat(str(row["placed_at"]).replace("Z", "+00:00")) if row["placed_at"] else None
+        filled_at = datetime.fromisoformat(str(row["filled_at"]).replace("Z", "+00:00")) if row["filled_at"] else None
+        if placed_at and filled_at:
+            fill_durations.append((filled_at - placed_at).total_seconds())
+        metadata = json.loads(row["metadata_json"] or "{}") if row["metadata_json"] else {}
+        midpoint_at_fill = metadata.get("midpoint_at_fill")
+        fill_price = row["fill_price"]
+        if midpoint_at_fill is not None and fill_price is not None:
+            midpoint_slippages.append((float(fill_price) - float(midpoint_at_fill)) * 100.0)
+    return {
+        "closed_orders": len(closed_rows),
+        "filled_orders": len(filled_rows),
+        "fill_rate": round(fill_rate, 6) if fill_rate is not None else None,
+        "avg_time_to_fill_seconds": round(sum(fill_durations) / len(fill_durations), 3) if fill_durations else None,
+        "avg_midpoint_slippage_cents": round(sum(midpoint_slippages) / len(midpoint_slippages), 4) if midpoint_slippages else None,
+    }
 
 
 async def mark_to_market(app_config: AppConfig, db: ArenaDB) -> None:

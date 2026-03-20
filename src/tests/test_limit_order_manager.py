@@ -1,5 +1,9 @@
+import asyncio
+from datetime import datetime, timezone
+
+from arena.db import ArenaDB
 from arena.engine.limit_order_manager import LimitOrderManager
-from arena.engine.order_types import OrderSide
+from arena.engine.order_types import LimitOrder, OrderSide, OrderStatus, PlacedOrder
 
 
 def _manager() -> LimitOrderManager:
@@ -86,3 +90,43 @@ def test_compute_limit_price_blocks_when_posted_edge_too_small():
         model_probability=0.45,
     )
     assert price is None
+
+
+def test_book_fill_merges_partial_fills_into_single_position(tmp_path):
+    db_path = tmp_path / "arena.db"
+    db = ArenaDB(db_path)
+    db.initialize()
+    db.ensure_portfolio("s1", 1000.0)
+    manager = LimitOrderManager(db_path=str(db_path), config={"default_starting_balance": 1000.0})
+    order = LimitOrder(
+        market_id="m1",
+        side=OrderSide.BUY_YES,
+        price=0.44,
+        size_dollars=44.0,
+        quantity=100.0,
+        strategy_id="s1",
+        model_probability=0.55,
+        edge_bps=1100,
+        metadata={"venue": "polymarket", "outcome_id": "yes", "outcome_label": "Yes", "decision_id": "d1"},
+    )
+    placed = PlacedOrder(
+        order_id="o1",
+        venue_order_id="vo1",
+        order=order,
+        status=OrderStatus.OPEN,
+        placed_at=datetime.now(timezone.utc),
+    )
+
+    async def run() -> None:
+        await manager._book_fill(placed, 0.44, 30.0, OrderStatus.PARTIALLY_FILLED, snapshot_id="snap1", midpoint_at_fill=0.45)
+        await manager._book_fill(placed, 0.46, 20.0, OrderStatus.PARTIALLY_FILLED, snapshot_id="snap2", midpoint_at_fill=0.47)
+
+    asyncio.run(run())
+
+    positions = db.list_open_positions("s1")
+    assert len(positions) == 1
+    assert positions[0].quantity == 50.0
+    assert round(positions[0].avg_entry_price, 4) == 0.448
+    portfolio = db.get_portfolio("s1")
+    assert portfolio is not None
+    assert round(portfolio.cash, 2) == 977.60

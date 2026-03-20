@@ -9,7 +9,6 @@ import os
 
 from arena.db import ArenaDB
 from arena.engine.order_types import LimitOrder, OrderSide, OrderStatus, OrderUpdate, PlacedOrder
-from arena.engine.portfolio import apply_execution_to_portfolio
 from arena.models import ExecutionResult, OrderBookSnapshot, Position, new_id, utc_now
 
 
@@ -136,6 +135,11 @@ class LimitOrderManager:
             for key, orderbook in current_orderbooks.items()
             if orderbook is not None
         }
+        snapshot_mids = {
+            key: getattr(orderbook, "mid", None)
+            for key, orderbook in current_orderbooks.items()
+            if orderbook is not None
+        }
 
         for update in updates:
             placed_order = next((item for item in open_orders if item.order_id == update.order_id), None)
@@ -181,9 +185,24 @@ class LimitOrderManager:
             newly_processed = max(effective_fill_qty - processed_fill_qty, 0.0)
             if newly_processed > 1e-9 and fill_price is not None:
                 snapshot_id = self._snapshot_id_for_order(placed_order, snapshot_ids)
-                await self._book_fill(placed_order, fill_price, newly_processed, update.new_status, snapshot_id=snapshot_id)
+                midpoint_at_fill = self._snapshot_mid_for_order(placed_order, snapshot_mids)
+                await self._book_fill(
+                    placed_order,
+                    fill_price,
+                    newly_processed,
+                    update.new_status,
+                    snapshot_id=snapshot_id,
+                    midpoint_at_fill=midpoint_at_fill,
+                )
                 with self.db.connect() as conn:
-                    metadata = {**placed_order.order.metadata, "processed_fill_quantity": effective_fill_qty}
+                    metadata = {
+                        **placed_order.order.metadata,
+                        "processed_fill_quantity": effective_fill_qty,
+                        "midpoint_at_fill": midpoint_at_fill,
+                        "latest_fill_price": fill_price,
+                        "latest_fill_quantity": newly_processed,
+                        "cumulative_fill_quantity": effective_fill_qty,
+                    }
                     self._update_order_row(conn, update.order_id, metadata=metadata)
 
             if update.new_status == OrderStatus.EXPIRED and self.config.get("auto_replace_expired"):
@@ -246,6 +265,18 @@ class LimitOrderManager:
             conn.execute(
                 "UPDATE limit_orders SET replaces = ? WHERE order_id = ?",
                 (order_id, placed.order_id),
+            )
+            self._insert_event(
+                conn,
+                order_id,
+                "repriced",
+                old_status=existing.status.value,
+                new_status=OrderStatus.CANCELLED.value,
+                details={
+                    "old_price": existing.order.price,
+                    "new_price": float(new_price),
+                    "replacement_order_id": placed.order_id,
+                },
             )
         return placed
 
@@ -622,6 +653,7 @@ class LimitOrderManager:
         status: OrderStatus,
         *,
         snapshot_id: str | None,
+        midpoint_at_fill: float | None = None,
     ) -> None:
         if self.db is None or fill_quantity <= 0:
             return
@@ -649,6 +681,9 @@ class LimitOrderManager:
         )
         outcome_label = str(placed_order.order.metadata.get("outcome_label") or placed_order.order.side.outcome_label)
         decision_id = str(placed_order.order.metadata.get("decision_id") or f"limit_{placed_order.order_id}")
+        midpoint_slippage = None
+        if midpoint_at_fill is not None:
+            midpoint_slippage = fill_price - float(midpoint_at_fill)
         execution = ExecutionResult(
             execution_id=new_id("exec"),
             decision_id=decision_id,
@@ -662,30 +697,50 @@ class LimitOrderManager:
             requested_amount_usd=round(fill_quantity * fill_price, 6),
             filled_quantity=fill_quantity,
             avg_fill_price=fill_price,
-            slippage_applied=0.0,
+            slippage_applied=float(midpoint_slippage or 0.0),
             fees_applied=0.0,
             total_cost=round(fill_quantity * fill_price, 6),
             rejection_reason=None,
             orderbook_snapshot_id=snapshot_id or new_id("book"),
         )
-        position = Position(
-            position_id=new_id("pos"),
+        position = self._merge_fill_into_position(
             strategy_id=placed_order.order.strategy_id,
             market_id=placed_order.order.market_id,
             venue=venue,
             outcome_id=outcome_id,
             outcome_label=outcome_label,
-            side="long",
-            quantity=fill_quantity,
-            avg_entry_price=fill_price,
-            current_price=fill_price,
-            unrealized_pnl=0.0,
-            entry_time=utc_now(),
-            entry_decision_id=decision_id,
+            fill_price=fill_price,
+            fill_quantity=fill_quantity,
+            decision_id=decision_id,
         )
         self.db.save_execution(execution)
         self.db.upsert_position(position)
-        portfolio = apply_execution_to_portfolio(portfolio, position, execution)
+        if midpoint_at_fill is not None:
+            with self.db.connect() as conn:
+                self._insert_event(
+                    conn,
+                    placed_order.order_id,
+                    "fill_booked",
+                    old_status=status.value,
+                    new_status=status.value,
+                    details={
+                        "fill_quantity": fill_quantity,
+                        "fill_price": fill_price,
+                        "midpoint_at_fill": midpoint_at_fill,
+                        "midpoint_slippage_cents": round((fill_price - midpoint_at_fill) * 100.0, 4),
+                        "cumulative_fill_quantity": fill_quantity,
+                    },
+                )
+        portfolio.cash -= execution.total_cost
+        portfolio.total_trades += 1
+        portfolio.positions = self.db.list_open_positions(portfolio.strategy_id)
+        portfolio.unrealized_pnl = sum(pos.unrealized_pnl for pos in portfolio.positions)
+        portfolio.total_value = portfolio.cash + sum(pos.quantity * pos.current_price for pos in portfolio.positions)
+        portfolio.peak_value = max(portfolio.peak_value, portfolio.total_value)
+        if portfolio.peak_value:
+            current_drawdown = max((portfolio.peak_value - portfolio.total_value) / portfolio.peak_value, 0.0)
+            portfolio.max_drawdown = max(portfolio.max_drawdown, current_drawdown)
+        portfolio.updated_at = utc_now()
         self.db.save_portfolio(portfolio)
 
     async def _replace_expired_order(self, placed_order: PlacedOrder, current_orderbooks: dict[Any, Any]) -> None:
@@ -757,6 +812,72 @@ class LimitOrderManager:
             if tuple_key in snapshot_ids:
                 return snapshot_ids[tuple_key]
         return snapshot_ids.get(placed_order.order.market_id)
+
+    def _snapshot_mid_for_order(self, placed_order: PlacedOrder, snapshot_mids: dict[Any, float | None]) -> float | None:
+        outcome_id = placed_order.order.metadata.get("outcome_id") or placed_order.order.metadata.get("token_id")
+        if outcome_id is not None:
+            tuple_key = (placed_order.order.market_id, str(outcome_id))
+            if tuple_key in snapshot_mids:
+                return snapshot_mids[tuple_key]
+        return snapshot_mids.get(placed_order.order.market_id)
+
+    def _merge_fill_into_position(
+        self,
+        *,
+        strategy_id: str,
+        market_id: str,
+        venue: str,
+        outcome_id: str,
+        outcome_label: str,
+        fill_price: float,
+        fill_quantity: float,
+        decision_id: str,
+    ) -> Position:
+        existing = None
+        for position in self.db.list_open_positions(strategy_id):
+            if (
+                position.market_id == market_id
+                and position.venue == venue
+                and str(position.outcome_id) == str(outcome_id)
+            ):
+                existing = position
+                break
+        if existing is None:
+            return Position(
+                position_id=new_id("pos"),
+                strategy_id=strategy_id,
+                market_id=market_id,
+                venue=venue,
+                outcome_id=outcome_id,
+                outcome_label=outcome_label,
+                side="long",
+                quantity=fill_quantity,
+                avg_entry_price=fill_price,
+                current_price=fill_price,
+                unrealized_pnl=0.0,
+                entry_time=utc_now(),
+                entry_decision_id=decision_id,
+            )
+
+        new_quantity = existing.quantity + fill_quantity
+        weighted_avg = ((existing.quantity * existing.avg_entry_price) + (fill_quantity * fill_price)) / new_quantity
+        return Position(
+            position_id=existing.position_id,
+            strategy_id=existing.strategy_id,
+            market_id=existing.market_id,
+            venue=existing.venue,
+            outcome_id=existing.outcome_id,
+            outcome_label=existing.outcome_label,
+            side=existing.side,
+            quantity=new_quantity,
+            avg_entry_price=weighted_avg,
+            current_price=fill_price,
+            unrealized_pnl=(fill_price - weighted_avg) * new_quantity,
+            entry_time=existing.entry_time,
+            entry_decision_id=existing.entry_decision_id,
+            status=existing.status,
+            last_updated_at=utc_now(),
+        )
 
     def _parse_dt(self, value: str) -> datetime:
         if value.endswith("Z"):

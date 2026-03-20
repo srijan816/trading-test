@@ -662,6 +662,7 @@ class ArenaDB:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(position_id) DO UPDATE SET
                     quantity=excluded.quantity,
+                    avg_entry_price=excluded.avg_entry_price,
                     current_price=excluded.current_price,
                     unrealized_pnl=excluded.unrealized_pnl,
                     status=excluded.status,
