@@ -370,7 +370,7 @@ class ForecastConsensusStrategy(Strategy):
         is_same_day = params.date == now.date()
         market_type = "low" if params.metric == "low" else "high"
         forecast_value_c = self._forecast_value_for_metric(contract, ensemble)
-        sigma_override = ensemble.get("ensemble_sigma_c")
+        sigma_override = self._sigma_for_metric(params.metric, ensemble)
 
         if is_same_day:
             observations = await self._get_observations(params.canonical_city)
@@ -552,7 +552,7 @@ class ForecastConsensusStrategy(Strategy):
         min_so_far = float(observations["min_temp_so_far_c"])
         trending = str(observations["trending"])
         hours_remaining = float(observations["hours_remaining"])
-        sigma = float(ensemble_forecast["ensemble_sigma_c"])
+        sigma = float(self._sigma_for_metric("low" if market_type == "low" else "high", ensemble_forecast))
 
         if market_type == "high":
             forecast_high = ensemble_forecast["ensemble_high_c"]
@@ -773,6 +773,16 @@ class ForecastConsensusStrategy(Strategy):
         high_value = ensemble.get("ensemble_high_c")
         return float(high_value) if high_value is not None else None
 
+    def _sigma_for_metric(self, metric: str | None, ensemble: dict) -> float:
+        if str(metric or "high").lower() == "low":
+            low_sigma = ensemble.get("ensemble_sigma_low_c")
+            if low_sigma is not None:
+                return float(low_sigma)
+        high_sigma = ensemble.get("ensemble_sigma_high_c")
+        if high_sigma is not None:
+            return float(high_sigma)
+        return float(ensemble.get("ensemble_sigma_c", 2.0) or 2.0)
+
     def _allow_intraday_extreme(self, contract: dict, observations: dict | None) -> bool:
         if not observations:
             return False
@@ -841,7 +851,9 @@ class ForecastConsensusStrategy(Strategy):
                 "content": (
                     f"{params.canonical_city} {params.metric} ensemble: "
                     f"high={ensemble.get('ensemble_high_c')}C low={ensemble.get('ensemble_low_c')}C "
-                    f"sigma={ensemble.get('ensemble_sigma_c')}C from {ensemble.get('sources_used')} sources."
+                    f"high_sigma={ensemble.get('ensemble_sigma_high_c', ensemble.get('ensemble_sigma_c'))}C "
+                    f"low_sigma={ensemble.get('ensemble_sigma_low_c', ensemble.get('ensemble_sigma_c'))}C "
+                    f"from {ensemble.get('sources_used')} sources."
                 ),
             },
             {

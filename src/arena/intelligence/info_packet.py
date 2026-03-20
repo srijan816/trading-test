@@ -339,11 +339,11 @@ class InfoPacketBuilder:
         if not yes_outcome or not no_outcome:
             return None
         ensemble = await self._forecast_strategy._get_ensemble(contract["city"], contract["forecast_date"])
-        forecast_high_c = ensemble["ensemble_high_c"] if ensemble else None
-        if forecast_high_c is None:
+        forecast_value_c = self._forecast_strategy._forecast_value_for_metric(contract, ensemble) if ensemble else None
+        if forecast_value_c is None:
             return None
-        ensemble_sigma = ensemble["ensemble_sigma_c"] if ensemble else None
-        predicted_yes = self._forecast_strategy._estimate_probability(contract, forecast_high_c, sigma_override=ensemble_sigma)
+        ensemble_sigma = self._forecast_strategy._sigma_for_metric(contract.get("metric"), ensemble) if ensemble else None
+        predicted_yes = self._forecast_strategy._estimate_probability(contract, forecast_value_c, sigma_override=ensemble_sigma)
         predicted_no = 1.0 - predicted_yes
         yes_price = self._forecast_strategy._buy_price(yes_outcome)
         no_price = self._forecast_strategy._buy_price(no_outcome)
@@ -355,7 +355,7 @@ class InfoPacketBuilder:
         priced_probability = predicted_yes if best_side == "BUY_YES" else predicted_no
         market_price = yes_price if best_side == "BUY_YES" else no_price
         signal = {
-            "forecast_temperature_c": round(forecast_high_c, 2),
+            "forecast_temperature_c": round(forecast_value_c, 2),
             "forecast_implied_yes_probability": round(predicted_yes, 3),
             "forecast_implied_no_probability": round(predicted_no, 3),
             "buy_yes_ask": round(yes_price, 4),
@@ -368,9 +368,9 @@ class InfoPacketBuilder:
             "edge_on_no_bps": no_edge_bps,
             "algo_would_trade": best_side,
             "algo_edge_bps": best_edge_bps,
-            "algo_confidence": self._describe_forecast_confidence(contract, forecast_high_c, best_edge_bps),
+            "algo_confidence": self._describe_forecast_confidence(contract, forecast_value_c, best_edge_bps),
             "precomputed_edge_hint": (
-                f"Forecast says {forecast_high_c:.1f}°C. The algorithm estimates {priced_probability:.3f} fair probability for "
+                f"Forecast says {forecast_value_c:.1f}°C. The algorithm estimates {priced_probability:.3f} fair probability for "
                 f"{priced_outcome.get('label')} and sees executable ask {market_price:.4f}, implying {best_edge_bps} bps of edge on {best_side}."
             ),
             "your_job": (
@@ -382,7 +382,9 @@ class InfoPacketBuilder:
             signal["ensemble_sources_used"] = ensemble["sources_used"]
             signal["ensemble_source_names"] = ensemble["source_names"]
             signal["ensemble_confidence"] = ensemble["confidence"]
-            signal["ensemble_sigma_c"] = ensemble["ensemble_sigma_c"]
+            signal["ensemble_sigma_c"] = ensemble_sigma
+            signal["ensemble_sigma_high_c"] = ensemble.get("ensemble_sigma_high_c")
+            signal["ensemble_sigma_low_c"] = ensemble.get("ensemble_sigma_low_c")
             signal["bias_correction_applied_c"] = ensemble["bias_correction_applied_c"]
         if self._kalshi_adapter.enabled:
             target_date = contract["forecast_date"].isoformat()
@@ -1249,21 +1251,28 @@ class InfoPacketBuilder:
                 ensemble = await self._forecast_strategy._get_ensemble(contract["city"], contract["forecast_date"])
                 if ensemble:
                     threshold_c = self._forecast_strategy._contract_threshold_c(contract)
+                    forecast_value_c = self._forecast_strategy._forecast_value_for_metric(contract, ensemble)
+                    if forecast_value_c is None:
+                        payload["calibration_data"] = self._build_calibration_context(contract["city"])
+                        return payload
+                    ensemble_sigma = self._forecast_strategy._sigma_for_metric(contract.get("metric"), ensemble)
                     payload["ensemble_data"] = {
-                        "mu": float(ensemble["ensemble_high_c"]),
-                        "sigma": float(ensemble["ensemble_sigma_c"]),
+                        "mu": float(forecast_value_c),
+                        "sigma": float(ensemble_sigma),
                         "unit": "celsius",
                         "sources": {
-                            str(item["source"]): float(item["temp_high_c"])
+                            str(item["source"]): float(
+                                item["temp_low_c"] if contract.get("metric") == "low" else item["temp_high_c"]
+                            )
                             for item in ensemble.get("raw_forecasts", [])
-                            if item.get("temp_high_c") is not None
+                            if (item.get("temp_low_c") if contract.get("metric") == "low" else item.get("temp_high_c")) is not None
                         },
                         "threshold": float(threshold_c) if threshold_c is not None else None,
                         "ensemble_probability": float(
                             self._forecast_strategy._estimate_probability(
                                 contract,
-                                float(ensemble["ensemble_high_c"]),
-                                sigma_override=float(ensemble["ensemble_sigma_c"]),
+                                float(forecast_value_c),
+                                sigma_override=float(ensemble_sigma),
                             )
                         ),
                     }

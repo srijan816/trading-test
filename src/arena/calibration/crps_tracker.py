@@ -79,6 +79,12 @@ class CRPSTracker:
         return str(entry.get("city", "")).strip().lower() == str(city).strip().lower()
 
     @staticmethod
+    def _matches_metric(entry: dict, metric: str | None) -> bool:
+        if metric is None:
+            return True
+        return str(entry.get("metric", "high")).strip().lower() == str(metric).strip().lower()
+
+    @staticmethod
     def _clamp_probability(value: float) -> float:
         return max(0.0, min(1.0, float(value)))
 
@@ -120,12 +126,15 @@ class CRPSTracker:
         sigma: float,
         city: str,
         target_date: str,
+        metric: str | None = None,
         sources: dict | None = None,
         observed_high_c: float | None = None,
+        observed_low_c: float | None = None,
         observation_source: str | None = None,
         observation_timestamp: str | None = None,
         observation_secondary_source: str | None = None,
         observation_secondary_high_c: float | None = None,
+        observation_secondary_low_c: float | None = None,
         observation_disagreement_c: float | None = None,
     ) -> dict | None:
         """
@@ -178,13 +187,18 @@ class CRPSTracker:
             "market_id": market_id,
             "city": city,
             "target_date": target_date,
+            "metric": str(metric or "high").strip().lower(),
             "observation": float(observation),
             "observed_high_c": float(observed_high_c) if observed_high_c is not None else None,
+            "observed_low_c": float(observed_low_c) if observed_low_c is not None else None,
             "observation_source": observation_source,
             "observation_timestamp": observation_timestamp,
             "observation_secondary_source": observation_secondary_source,
             "observation_secondary_high_c": (
                 float(observation_secondary_high_c) if observation_secondary_high_c is not None else None
+            ),
+            "observation_secondary_low_c": (
+                float(observation_secondary_low_c) if observation_secondary_low_c is not None else None
             ),
             "observation_disagreement_c": (
                 float(observation_disagreement_c) if observation_disagreement_c is not None else None
@@ -221,11 +235,14 @@ class CRPSTracker:
         question: str,
         forecast_prob: float,
         actual_outcome: float,
+        metric: str | None = None,
         observed_high_c: float | None = None,
+        observed_low_c: float | None = None,
         observation_source: str | None = None,
         observation_timestamp: str | None = None,
         observation_secondary_source: str | None = None,
         observation_secondary_high_c: float | None = None,
+        observation_secondary_low_c: float | None = None,
         observation_disagreement_c: float | None = None,
     ) -> dict | None:
         if self._recent_brier_duplicate(market_id=market_id, target_date=target_date):
@@ -239,17 +256,22 @@ class CRPSTracker:
             "timestamp": datetime.now(UTC).isoformat(),
             "city": city,
             "target_date": target_date,
+            "metric": str(metric or "high").strip().lower(),
             "market_id": market_id,
             "question": question,
             "forecast_probability": round(forecast_probability, 6),
             "actual_outcome": int(actual),
             "brier_score": round(float(brier_score), 6),
             "observed_high_c": float(observed_high_c) if observed_high_c is not None else None,
+            "observed_low_c": float(observed_low_c) if observed_low_c is not None else None,
             "observation_source": observation_source,
             "observation_timestamp": observation_timestamp,
             "observation_secondary_source": observation_secondary_source,
             "observation_secondary_high_c": (
                 float(observation_secondary_high_c) if observation_secondary_high_c is not None else None
+            ),
+            "observation_secondary_low_c": (
+                float(observation_secondary_low_c) if observation_secondary_low_c is not None else None
             ),
             "observation_disagreement_c": (
                 float(observation_disagreement_c) if observation_disagreement_c is not None else None
@@ -260,7 +282,12 @@ class CRPSTracker:
             handle.write(json.dumps(entry) + "\n")
         return entry
 
-    def get_calibration_summary(self, city: str | None = None, last_n_days: int = 30) -> dict:
+    def get_calibration_summary(
+        self,
+        city: str | None = None,
+        last_n_days: int = 30,
+        metric: str | None = None,
+    ) -> dict:
         self._load_history()
         cutoff = datetime.now(UTC) - timedelta(days=max(int(last_n_days), 1))
 
@@ -268,6 +295,7 @@ class CRPSTracker:
             entry
             for entry in self.history
             if (city is None or self._matches_city(entry, city))
+            and self._matches_metric(entry, metric)
             and (timestamp := self._parse_timestamp(entry.get("timestamp"))) is not None
             and timestamp >= cutoff
         ]
@@ -275,6 +303,7 @@ class CRPSTracker:
             entry
             for entry in self.brier_history
             if (city is None or self._matches_city(entry, city))
+            and self._matches_metric(entry, metric)
             and (timestamp := self._parse_timestamp(entry.get("timestamp"))) is not None
             and timestamp >= cutoff
         ]
@@ -300,21 +329,23 @@ class CRPSTracker:
                 sigma_trend = "degrading"
 
         city_label = city or "all"
+        scope_label = f"{city_label}/{metric}" if metric else city_label
         if len(crps_records) < 5:
-            recommended_action = f"collect at least 5 resolved markets for {city_label}"
+            recommended_action = f"collect at least 5 resolved markets for {scope_label}"
         elif calibration_ratio > 5.0:
-            recommended_action = f"widen sigma by 2.0x for {city_label}"
+            recommended_action = f"widen sigma by 2.0x for {scope_label}"
         elif calibration_ratio > 2.0:
-            recommended_action = f"widen sigma by 1.5x for {city_label}"
+            recommended_action = f"widen sigma by 1.5x for {scope_label}"
         elif calibration_ratio > 1.5:
-            recommended_action = f"widen sigma by 1.2x for {city_label}"
+            recommended_action = f"widen sigma by 1.2x for {scope_label}"
         elif calibration_ratio < 0.8:
-            recommended_action = f"narrow sigma by 0.9x for {city_label}"
+            recommended_action = f"narrow sigma by 0.9x for {scope_label}"
         else:
-            recommended_action = f"hold sigma steady for {city_label}"
+            recommended_action = f"hold sigma steady for {scope_label}"
 
         return {
             "city": city_label,
+            "metric": metric or "all",
             "n_records": len(crps_records),
             "mean_crps": round(mean_crps, 6),
             "median_crps": round(median_crps, 6),

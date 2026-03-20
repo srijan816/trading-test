@@ -280,8 +280,15 @@ def _resolve_db_path(db_path_or_db) -> Path | None:
     return Path(candidate) if candidate else None
 
 
-def load_latest_sigma(db_path: str | Path, city: str) -> float | None:
-    """Load and mark the most recent city-specific sigma recommendation."""
+def _sigma_parameter_names(metric: str | None) -> list[str]:
+    normalized = str(metric or "high").strip().lower()
+    if normalized == "low":
+        return ["ensemble_sigma_low", "ensemble_sigma"]
+    return ["ensemble_sigma_high", "ensemble_sigma"]
+
+
+def load_latest_sigma(db_path: str | Path, city: str, metric: str = "high") -> float | None:
+    """Load and mark the most recent city+metric sigma recommendation."""
     db_file = Path(db_path)
     if not db_file.exists():
         return None
@@ -292,24 +299,32 @@ def load_latest_sigma(db_path: str | Path, city: str) -> float | None:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(parameter_adjustments)").fetchall()}
         if "city" not in columns:
             return None
-        row = conn.execute(
-            """
-            SELECT id, recommended_value
-            FROM parameter_adjustments
-            WHERE lower(city) = lower(?) AND parameter_name = 'ensemble_sigma'
-            ORDER BY created_at DESC, id DESC
-            LIMIT 1
-            """,
-            (city,),
-        ).fetchone()
-        if row is None:
-            return None
-        adj_id, recommended_sigma = int(row["id"]), float(row["recommended_value"])
-        if recommended_sigma <= 0:
-            return None
-        conn.execute("UPDATE parameter_adjustments SET auto_applied = 1 WHERE id = ?", (adj_id,))
-        conn.commit()
-        return recommended_sigma
+        for parameter_name in _sigma_parameter_names(metric):
+            row = conn.execute(
+                """
+                SELECT id, recommended_value
+                FROM parameter_adjustments
+                WHERE lower(city) = lower(?) AND parameter_name = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (city, parameter_name),
+            ).fetchone()
+            if row is None:
+                continue
+            adj_id, recommended_sigma = int(row["id"]), float(row["recommended_value"])
+            if recommended_sigma <= 0:
+                return None
+            conn.execute("UPDATE parameter_adjustments SET auto_applied = 1 WHERE id = ?", (adj_id,))
+            conn.commit()
+            logger.info(
+                "Loaded calibrated sigma for %s/%s from parameter_adjustments: %.3fC",
+                city,
+                metric,
+                recommended_sigma,
+            )
+            return recommended_sigma
+        return None
     finally:
         conn.close()
 
@@ -402,19 +417,36 @@ async def get_ensemble_forecast(
     # 2. sigma_calibration.json / hardcoded calibration multiplier
     # 3. Raw inverse-variance ensemble spread
     db_path = _resolve_db_path(db)
-    adjusted_sigma = load_latest_sigma(db_path, location_name) if db_path is not None else None
-    if adjusted_sigma is not None:
+    adjusted_sigma_high = load_latest_sigma(db_path, location_name, metric="high") if db_path is not None else None
+    adjusted_sigma_low = load_latest_sigma(db_path, location_name, metric="low") if db_path is not None else None
+    if adjusted_sigma_high is not None:
         logger.info(
-            "Using calibrated sigma for %s: %.3fC (from parameter_adjustments)",
+            "Using calibrated high sigma for %s: %.3fC (from parameter_adjustments)",
             location_name,
-            adjusted_sigma,
+            adjusted_sigma_high,
         )
-        final_sigma = max(float(adjusted_sigma), 0.5)
-        sigma_source = "parameter_adjustments"
+        final_sigma_high = max(float(adjusted_sigma_high), 0.5)
+        sigma_source_high = "parameter_adjustments"
     else:
-        logger.info("Using default sigma for %s: %.3fC", location_name, default_sigma)
-        final_sigma = default_sigma
-        sigma_source = "sigma_calibration.json" if calibration.get("loaded_from") != "hardcoded defaults" else "default"
+        logger.info("Using default high sigma for %s: %.3fC", location_name, default_sigma)
+        final_sigma_high = default_sigma
+        sigma_source_high = "sigma_calibration.json" if calibration.get("loaded_from") != "hardcoded defaults" else "default"
+
+    if mean_low is not None:
+        if adjusted_sigma_low is not None:
+            logger.info(
+                "Using calibrated low sigma for %s: %.3fC (from parameter_adjustments)",
+                location_name,
+                adjusted_sigma_low,
+            )
+            final_sigma_low = max(float(adjusted_sigma_low), 0.5)
+            sigma_source_low = "parameter_adjustments"
+        else:
+            final_sigma_low = default_sigma
+            sigma_source_low = "sigma_calibration.json" if calibration.get("loaded_from") != "hardcoded defaults" else "default"
+    else:
+        final_sigma_low = None
+        sigma_source_low = None
 
     source_count = len(forecasts)
     if source_count >= 3:
@@ -433,9 +465,17 @@ async def get_ensemble_forecast(
         "ensemble_high_c": round(mean_high, 2),
         "ensemble_low_c": round(mean_low, 2) if mean_low is not None else None,
         "ensemble_method": "rmse_weighted",
-        "ensemble_sigma_c": round(final_sigma, 2),
-        "sigma_multiplier_used": round(final_sigma / weighted_sigma, 3) if weighted_sigma > 0 else None,
-        "sigma_source": sigma_source,
+        "ensemble_sigma_c": round(final_sigma_high, 2),
+        "ensemble_sigma_high_c": round(final_sigma_high, 2),
+        "ensemble_sigma_low_c": round(final_sigma_low, 2) if final_sigma_low is not None else None,
+        "sigma_multiplier_used": round(final_sigma_high / weighted_sigma, 3) if weighted_sigma > 0 else None,
+        "sigma_multiplier_high_used": round(final_sigma_high / weighted_sigma, 3) if weighted_sigma > 0 else None,
+        "sigma_multiplier_low_used": (
+            round(final_sigma_low / weighted_sigma, 3) if weighted_sigma > 0 and final_sigma_low is not None else None
+        ),
+        "sigma_source": sigma_source_high,
+        "sigma_source_high": sigma_source_high,
+        "sigma_source_low": sigma_source_low,
         "bias_correction_applied_c": 0.0,
         "bias_corrections_applied": {source: round(bias, 3) for source, bias in bias_corrections_applied.items()},
         "source_weights": {source: round(weight, 6) for source, weight in source_weights.items()},

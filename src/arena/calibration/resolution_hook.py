@@ -72,7 +72,9 @@ def _parse_weather_market_question(question: str) -> dict[str, object] | None:
     city = None
     city_patterns = (
         r"highest temperature in ([A-Za-z .'-]+?) be",
+        r"lowest temperature in ([A-Za-z .'-]+?) be",
         r"will ([A-Za-z .'-]+?) high\b",
+        r"will ([A-Za-z .'-]+?) low\b",
         r"will ([A-Za-z .'-]+?) hit\b",
         r"for ([A-Za-z .'-]+?) on\b",
         r"in ([A-Za-z .'-]+?) on\b",
@@ -100,6 +102,9 @@ def _parse_weather_market_question(question: str) -> dict[str, object] | None:
     threshold = None
     threshold_c = None
     shape = None
+    metric = "low" if re.search(r"\blow(?:est)? temperature\b", normalized, re.IGNORECASE) else "high"
+    if re.search(r"\brain\b", normalized, re.IGNORECASE):
+        metric = "rain"
 
     between = re.search(r"between (\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*°?\s*([CF])", normalized, re.IGNORECASE)
     if between:
@@ -110,6 +115,7 @@ def _parse_weather_market_question(question: str) -> dict[str, object] | None:
             "target_date": target_date,
             "unit": between.group(3).lower(),
             "shape": "between",
+            "metric": metric,
             "lower": lower,
             "upper": upper,
         }
@@ -137,15 +143,18 @@ def _parse_weather_market_question(question: str) -> dict[str, object] | None:
         "target_date": target_date,
         "unit": unit,
         "shape": shape or "unknown",
+        "metric": metric,
         "threshold": threshold,
         "threshold_c": round(threshold_c, 3) if threshold_c is not None else None,
     }
     return parsed
 
 
-def _extract_gaussian_inputs(evidence_items: list[dict]) -> tuple[float | None, float | None, list[str]]:
-    mu_c: float | None = None
-    sigma_c: float | None = None
+def _extract_gaussian_inputs(evidence_items: list[dict]) -> dict[str, object]:
+    mu_high_c: float | None = None
+    mu_low_c: float | None = None
+    sigma_high_c: float | None = None
+    sigma_low_c: float | None = None
     source_names: list[str] = []
 
     for item in evidence_items:
@@ -161,21 +170,42 @@ def _extract_gaussian_inputs(evidence_items: list[dict]) -> tuple[float | None, 
                 re.IGNORECASE,
             )
             if match:
-                mu_c = float(match.group(1))
-                sigma_c = float(match.group(2))
+                mu_high_c = float(match.group(1))
+                sigma_high_c = float(match.group(2))
                 if match.group(3):
                     source_names = [part.strip() for part in match.group(3).split(",") if part.strip()]
                 continue
 
-        if mu_c is None:
+        detailed_match = re.search(
+            r"high=(?P<high>-?\d+\.?\d*)C\s+low=(?P<low>-?\d+\.?\d*|None)C\s+high_sigma=(?P<high_sigma>\d+\.?\d*)C\s+low_sigma=(?P<low_sigma>\d+\.?\d*|None)C",
+            content,
+            re.IGNORECASE,
+        )
+        if detailed_match:
+            mu_high_c = float(detailed_match.group("high"))
+            low_token = detailed_match.group("low")
+            if low_token.lower() != "none":
+                mu_low_c = float(low_token)
+            sigma_high_c = float(detailed_match.group("high_sigma"))
+            low_sigma_token = detailed_match.group("low_sigma")
+            if low_sigma_token.lower() != "none":
+                sigma_low_c = float(low_sigma_token)
+            continue
+
+        if mu_high_c is None:
             forecast_match = re.search(r"high forecast\s*(-?\d+\.?\d*)\s*°?C", content, re.IGNORECASE)
             if forecast_match:
-                mu_c = float(forecast_match.group(1))
+                mu_high_c = float(forecast_match.group(1))
 
-        if sigma_c is None:
+        if mu_low_c is None:
+            forecast_low_match = re.search(r"low forecast\s*(-?\d+\.?\d*)\s*°?C", content, re.IGNORECASE)
+            if forecast_low_match:
+                mu_low_c = float(forecast_low_match.group(1))
+
+        if sigma_high_c is None:
             sigma_match = re.search(r"(\d+\.?\d*)\s*°?C sigma", content, re.IGNORECASE)
             if sigma_match:
-                sigma_c = float(sigma_match.group(1))
+                sigma_high_c = float(sigma_match.group(1))
 
         if not source_names:
             source_match = re.search(r"ensemble \(([^)]*)\)", content, re.IGNORECASE)
@@ -186,7 +216,13 @@ def _extract_gaussian_inputs(evidence_items: list[dict]) -> tuple[float | None, 
             if model_match:
                 source_names = [part.strip().lower().replace("-", "_") for part in model_match.group(2).split(",") if part.strip()]
 
-    return mu_c, sigma_c, source_names
+    return {
+        "mu_high_c": mu_high_c,
+        "mu_low_c": mu_low_c,
+        "sigma_high_c": sigma_high_c,
+        "sigma_low_c": sigma_low_c,
+        "source_names": source_names,
+    }
 
 
 def _compute_market_probability(parsed_weather: dict[str, object], mu_c: float, sigma_c: float) -> float | None:
@@ -227,18 +263,13 @@ def compute_sigma_adjustment(current_sigma: float, crps_ratio: float, n_observat
     ratio = float(crps_ratio)
     observations = int(n_observations)
 
-    if observations < 5:
+    if observations < 3:
         adjusted = sigma
-    elif ratio > 5.0:
-        adjusted = sigma * 2.0
-    elif ratio > 2.0:
-        adjusted = sigma * 1.5
-    elif ratio > 1.5:
-        adjusted = sigma * 1.2
-    elif ratio < 0.8:
-        adjusted = sigma * 0.9
     else:
-        adjusted = sigma
+        target_ratio = 1.25
+        raw_multiplier = max(0.7, min(4.0, ratio / target_ratio if target_ratio > 0 else 1.0))
+        confidence_weight = min(1.0, max(0.35, observations / 8.0))
+        adjusted = sigma * (1.0 + ((raw_multiplier - 1.0) * confidence_weight))
 
     return round(min(max(adjusted, 0.5), 10.0), 3)
 
@@ -281,14 +312,15 @@ def _write_sigma_adjustment_for_city(
     tracker: CRPSTracker,
     *,
     city: str,
+    metric: str,
     current_sigma_c: float,
 ) -> int | None:
-    summary = tracker.get_calibration_summary(city=city, last_n_days=30)
+    summary = tracker.get_calibration_summary(city=city, last_n_days=30, metric=metric)
     n_records = int(summary.get("n_records", 0) or 0)
     calibration_ratio = float(summary.get("calibration_ratio", 0.0) or 0.0)
     recommended_sigma_c = compute_sigma_adjustment(current_sigma_c, calibration_ratio, n_records)
 
-    if n_records < 5 or abs(recommended_sigma_c - float(current_sigma_c)) < 0.01:
+    if n_records < 3 or abs(recommended_sigma_c - float(current_sigma_c)) < 0.01:
         return None
 
     latest_row = None
@@ -297,11 +329,11 @@ def _write_sigma_adjustment_for_city(
             """
             SELECT recommended_value, created_at
             FROM parameter_adjustments
-            WHERE lower(city) = lower(?) AND parameter_name = 'ensemble_sigma'
+            WHERE lower(city) = lower(?) AND parameter_name = ?
             ORDER BY created_at DESC, id DESC
             LIMIT 1
             """,
-            (city,),
+            (city, f"ensemble_sigma_{metric}"),
         ).fetchone()
 
     if latest_row and abs(float(latest_row["recommended_value"]) - recommended_sigma_c) < 0.01:
@@ -309,13 +341,13 @@ def _write_sigma_adjustment_for_city(
 
     reason = (
         f"CRPS calibration ratio {calibration_ratio:.2f}x across {n_records} resolved markets "
-        f"for {city} - recommend sigma {current_sigma_c:.2f}C -> {recommended_sigma_c:.2f}C"
+        f"for {city} {metric} - recommend sigma {current_sigma_c:.2f}C -> {recommended_sigma_c:.2f}C"
     )
     return _write_parameter_adjustment(
         db,
         strategy_id="weather_ensemble",
         city=city,
-        parameter_name="ensemble_sigma",
+        parameter_name=f"ensemble_sigma_{metric}",
         current_value=current_sigma_c,
         recommended_value=recommended_sigma_c,
         reason=reason,
@@ -327,6 +359,7 @@ def _load_source_forecasts(
     location: str | None,
     target_date: str | None,
     source_names: list[str] | None = None,
+    metric: str = "high",
 ) -> dict[str, float]:
     if not location or not target_date:
         return {}
@@ -334,16 +367,17 @@ def _load_source_forecasts(
     with db.connect() as conn:
         rows = list(
             conn.execute(
-                "SELECT source, predicted_high_c FROM forecast_history "
+                "SELECT source, predicted_high_c, predicted_low_c FROM forecast_history "
                 "WHERE lower(location) = lower(?) AND target_date = ?",
                 (location, target_date),
             )
         )
 
+    column_name = "predicted_low_c" if metric == "low" else "predicted_high_c"
     source_values = {
-        str(row["source"]): round(_c_to_f(float(row["predicted_high_c"])), 2)
+        str(row["source"]): round(_c_to_f(float(row[column_name])), 2)
         for row in rows
-        if row["predicted_high_c"] is not None
+        if row[column_name] is not None
     }
     if source_names:
         filtered = {name: source_values[name] for name in source_names if name in source_values}
@@ -390,14 +424,16 @@ def _load_latest_decision_context(db: ArenaDB, market_id: str) -> dict[str, obje
         return None
     evidence_json = row["evidence_items_json"]
     evidence = json.loads(evidence_json) if isinstance(evidence_json, str) else (evidence_json or [])
-    mu_c, sigma_c, source_names = _extract_gaussian_inputs(evidence)
+    gaussian_inputs = _extract_gaussian_inputs(evidence)
     return {
         "decision_id": str(row["decision_id"]),
         "timestamp": str(row["timestamp"]),
         "evidence": evidence,
-        "mu_c": mu_c,
-        "sigma_c": sigma_c,
-        "source_names": source_names,
+        "mu_high_c": gaussian_inputs.get("mu_high_c"),
+        "mu_low_c": gaussian_inputs.get("mu_low_c"),
+        "sigma_high_c": gaussian_inputs.get("sigma_high_c"),
+        "sigma_low_c": gaussian_inputs.get("sigma_low_c"),
+        "source_names": gaussian_inputs.get("source_names") or [],
     }
 
 
@@ -570,23 +606,33 @@ async def on_market_resolved(
                 (row["decision_id"], market_id, row["strategy_id"], predicted_prob, actual_outcome, round(brier, 6), forecast_error_c),
             )
 
-    if actual_high is not None and latest_decision_context:
-        forecast_mu_c = latest_decision_context.get("mu_c")
-        forecast_sigma_c = latest_decision_context.get("sigma_c")
+    forecast_metric = str((parsed_weather or {}).get("metric") or "high").lower()
+    observed_temp_c = float(actual_low) if forecast_metric == "low" and actual_low is not None else actual_high
+    if observed_temp_c is not None and latest_decision_context:
+        forecast_mu_c = (
+            latest_decision_context.get("mu_low_c") if forecast_metric == "low" else latest_decision_context.get("mu_high_c")
+        )
+        forecast_sigma_c = (
+            latest_decision_context.get("sigma_low_c")
+            if forecast_metric == "low"
+            else latest_decision_context.get("sigma_high_c")
+        )
         source_names = latest_decision_context.get("source_names") or []
 
         if forecast_mu_c is not None and forecast_sigma_c is not None and forecast_sigma_c > 0:
             city = str(location or resolution_data.get("location") or "unknown")
-            source_forecasts = _load_source_forecasts(db, city, target_date, source_names)
+            source_forecasts = _load_source_forecasts(db, city, target_date, source_names, metric=forecast_metric)
             crps_tracker.record(
                 market_id=market_id,
-                observation=_c_to_f(float(actual_high)),
+                observation=_c_to_f(float(observed_temp_c)),
                 mu=_c_to_f(float(forecast_mu_c)),
                 sigma=_delta_c_to_f(float(forecast_sigma_c)),
                 city=city,
                 target_date=target_date or "",
+                metric=forecast_metric,
                 sources=source_forecasts,
                 observed_high_c=float(actual_high),
+                observed_low_c=float(actual_low) if actual_low is not None else None,
                 observation_source=str(observation_details.get("source") or "unknown"),
                 observation_timestamp=str(observation_details.get("timestamp") or ""),
                 observation_secondary_source=str(observation_details.get("secondary_source") or ""),
@@ -594,6 +640,7 @@ async def on_market_resolved(
                     float(observation_details["secondary_high_c"])
                     if observation_details.get("secondary_high_c") is not None else None
                 ),
+                observation_secondary_low_c=None,
                 observation_disagreement_c=(
                     float(observation_details["disagreement_c"])
                     if observation_details.get("disagreement_c") is not None else None
@@ -610,7 +657,9 @@ async def on_market_resolved(
                         question=str(market_context.get("question") or ""),
                         forecast_prob=forecast_probability,
                         actual_outcome=float(actual_market_outcome),
+                        metric=forecast_metric,
                         observed_high_c=float(actual_high),
+                        observed_low_c=float(actual_low) if actual_low is not None else None,
                         observation_source=str(observation_details.get("source") or "unknown"),
                         observation_timestamp=str(observation_details.get("timestamp") or ""),
                         observation_secondary_source=str(observation_details.get("secondary_source") or ""),
@@ -618,6 +667,7 @@ async def on_market_resolved(
                             float(observation_details["secondary_high_c"])
                             if observation_details.get("secondary_high_c") is not None else None
                         ),
+                        observation_secondary_low_c=None,
                         observation_disagreement_c=(
                             float(observation_details["disagreement_c"])
                             if observation_details.get("disagreement_c") is not None else None
@@ -628,6 +678,7 @@ async def on_market_resolved(
                 db,
                 crps_tracker,
                 city=city,
+                metric=forecast_metric,
                 current_sigma_c=float(forecast_sigma_c),
             )
         elif str(market_context.get("category")) == "weather":

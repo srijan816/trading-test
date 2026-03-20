@@ -587,9 +587,9 @@ def get_city_calibration(
     if table_exists(conn, "parameter_adjustments"):
         adjustments = conn.execute(
             """
-            SELECT strategy_id, parameter_name, current_value, recommended_value, reason, auto_applied, created_at
+            SELECT strategy_id, parameter_name, current_value, recommended_value, reason, auto_applied, created_at, city
             FROM parameter_adjustments
-            WHERE parameter_name = 'ensemble_sigma'
+            WHERE parameter_name LIKE 'ensemble_sigma%'
             ORDER BY created_at DESC
             """
         ).fetchall()
@@ -603,7 +603,7 @@ def get_city_calibration(
         matched_adjustment = None
         city_lower = city.lower()
         for adjustment in adjustments:
-            haystack = f"{adjustment['strategy_id']} {adjustment['reason']}".lower()
+            haystack = f"{adjustment['strategy_id']} {adjustment['reason']} {adjustment['city']}".lower()
             if city_lower in haystack:
                 matched_adjustment = adjustment
                 break
