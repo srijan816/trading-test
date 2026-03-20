@@ -93,7 +93,7 @@ class SettlementEngine:
             # No running event loop — fire synchronously (blocks but guarantees execution)
             try:
                 from arena.calibration.resolution_hook import on_market_resolved
-                on_market_resolved(self.db, market_id, venue, winning_outcome_id, resolved_metadata)
+                asyncio.run(on_market_resolved(self.db, market_id, venue, winning_outcome_id, resolved_metadata))
             except Exception as e:
                 logger.warning(f"Resolution hook failed (sync fallback): {e}")
         except Exception as e:
