@@ -200,6 +200,18 @@ async def scan_markets(app_config: AppConfig, db: ArenaDB) -> None:
                 db.record_event("weather_discovery_error", {"venue": venue, "error": str(exc)})
 
 
+async def run_discovery_scout(app_config: AppConfig, db: ArenaDB) -> None:
+    from arena.intelligence.discovery_scout import DiscoveryUniverseScanner
+
+    try:
+        scanner = DiscoveryUniverseScanner(db)
+        result = await scanner.scan()
+        db.record_event("discovery_scout", result)
+    except Exception as exc:
+        logger.exception("Discovery scout failed")
+        db.record_event("discovery_scout_error", {"error": str(exc)})
+
+
 def print_status(app_config: AppConfig, db: ArenaDB) -> None:
     counts = db.counts()
     print(
@@ -1649,6 +1661,7 @@ def main(argv: list[str] | None = None) -> None:
                 "mark_to_market": lambda: asyncio.run(mark_to_market(app_config, db)),
                 "monitor_limit_orders": lambda: asyncio.run(monitor_limit_orders(app_config, db, execution_services)),
                 "manage_open_positions": lambda: asyncio.run(manage_open_positions(app_config, db)),
+                "run_discovery_scout": lambda: asyncio.run(run_discovery_scout(app_config, db)),
                 "export_dashboard": lambda: export_dashboard(app_config, db),
                 "check_manual_responses": lambda: None,
                 "run_strategy": lambda strategy_id: asyncio.run(

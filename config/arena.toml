@@ -11,6 +11,7 @@ default_starting_balance = 1000.0
 scan_markets_minutes = 30
 poll_resolutions_minutes = 30
 mark_to_market_minutes = 15
+discovery_scout_minutes = 60
 export_dashboard_minutes = 15
 check_manual_responses_minutes = 30
 daily_snapshot_cron = "59 23 * * *"

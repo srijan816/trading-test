@@ -27,6 +27,8 @@ class SignalType(str, Enum):
     REGULATORY_CHANGE = "regulatory"
     SOURCE_DISAGREEMENT = "source_disagree"
     STALE_MARKET = "stale_market"
+    MARKET_EXPANSION = "market_expansion"
+    CROSS_VENUE = "cross_venue"
     NO_SIGNAL = "no_signal"
 
 

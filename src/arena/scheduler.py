@@ -16,6 +16,14 @@ def build_scheduler(app_config: AppConfig, jobs: dict[str, Callable[..., object]
     scheduler.add_job(jobs["scan_markets"], "interval", minutes=int(app_config.scheduler["scan_markets_minutes"]), id="scan_markets", replace_existing=True)
     scheduler.add_job(jobs["poll_resolutions"], "interval", minutes=int(app_config.scheduler["poll_resolutions_minutes"]), id="poll_resolutions", replace_existing=True)
     scheduler.add_job(jobs["mark_to_market"], "interval", minutes=int(app_config.scheduler["mark_to_market_minutes"]), id="mark_to_market", replace_existing=True)
+    if "run_discovery_scout" in jobs:
+        scheduler.add_job(
+            jobs["run_discovery_scout"],
+            "interval",
+            minutes=int(app_config.scheduler.get("discovery_scout_minutes", 60)),
+            id="run_discovery_scout",
+            replace_existing=True,
+        )
     if "monitor_limit_orders" in jobs:
         scheduler.add_job(
             jobs["monitor_limit_orders"],
