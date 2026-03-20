@@ -208,6 +208,7 @@ class LLMStrategy(Strategy):
             parsed["timestamp"] = datetime.now(timezone.utc).isoformat()
             parsed["strategy_id"] = self.strategy_id
             is_valid, parsed, validation_error = self._validate_decision(parsed, packet)
+            self._apply_discovery_signal_overrides(parsed, packet)
             if not is_valid:
                 self.db.record_event(
                     "llm_validation_warning",
@@ -423,6 +424,41 @@ class LLMStrategy(Strategy):
                 decision["no_action_reason"] = "; ".join(errors)
             return False, decision, "; ".join(errors)
         return True, decision, None
+
+    def _apply_discovery_signal_overrides(self, decision: dict, packet: dict) -> None:
+        opportunities = {
+            str(item.get("market_id")): item
+            for item in packet.get("opportunities", [])
+            if item.get("market_id")
+        }
+        target_market_ids = [str(action.get("market_id")) for action in decision.get("actions", []) if action.get("market_id")]
+        if not target_market_ids:
+            target_market_ids = [str(market_id) for market_id in decision.get("markets_considered", []) if str(market_id) in opportunities]
+
+        boosted_market_ids = [
+            market_id
+            for market_id in target_market_ids
+            if opportunities.get(market_id, {}).get("has_breaking_signal")
+        ]
+        if not boosted_market_ids:
+            return
+
+        current_confidence = float(decision.get("confidence") or 0.0)
+        current_edge = int(decision.get("expected_edge_bps") or 0)
+        decision["confidence"] = min(current_confidence + 0.08, 0.99)
+        decision["expected_edge_bps"] = current_edge + 250
+        note = f"Discovery boost applied for fresh signal on {', '.join(boosted_market_ids[:3])}"
+        decision["risk_notes"] = f"{decision.get('risk_notes', '').strip()} {note}".strip()
+        self.db.record_event(
+            "discovery_signal_boost_applied",
+            {
+                "strategy_id": self.strategy_id,
+                "market_ids": boosted_market_ids,
+                "new_confidence": decision["confidence"],
+                "new_expected_edge_bps": decision["expected_edge_bps"],
+            },
+            strategy_id=self.strategy_id,
+        )
 
     def _apply_kelly_sizing(self, decision: dict, opportunity_map: dict[str, dict]) -> str | None:
         if not decision.get("actions"):

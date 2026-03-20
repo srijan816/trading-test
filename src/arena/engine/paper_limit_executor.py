@@ -22,10 +22,16 @@ class PaperLimitExecutor:
     the resting price and a randomized delay has elapsed.
     """
 
-    def __init__(self, config: dict | None = None, seed: int | None = None) -> None:
+    def __init__(
+        self,
+        config: dict | None = None,
+        seed: int | None = None,
+        market_data_adapter=None,
+    ) -> None:
         self.config = config or {}
         self.random = random.Random(seed if seed is not None else int(os.getenv("LIMIT_ORDER_RANDOM_SEED", "7")))
         self._orders: dict[str, dict] = {}
+        self.market_data_adapter = market_data_adapter
 
     async def place_order(self, order: LimitOrder) -> PlacedOrder:
         """
@@ -198,6 +204,11 @@ class PaperLimitExecutor:
             state["status"] = OrderStatus.CANCELLED
             return True
         return False
+
+    async def get_orderbook(self, market_id: str, outcome_id: str):
+        if self.market_data_adapter is None:
+            return None
+        return await self.market_data_adapter.get_orderbook(market_id, outcome_id)
 
     def _resolve_orderbook(self, placed_order: PlacedOrder, current_orderbooks: dict):
         metadata = placed_order.order.metadata

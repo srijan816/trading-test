@@ -3,7 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-# Load .env before any other imports so env vars are available throughout
+# Load .env before any other imports so env vars are available throughout.
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - fallback for lean runtime environments
+    def load_dotenv(*_args, **_kwargs):
+        return False
+
+load_dotenv()
+
 from arena.env import load_local_env
 load_local_env()
 

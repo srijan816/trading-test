@@ -13,6 +13,7 @@ dependencies = [
   "openai>=1.68,<2",
   "fastapi>=0.135.1",
   "uvicorn>=0.42.0",
+  "python-dotenv>=1.0,<2",
   "properscoring>=0.1",
   "pykalshi>=0.5.0",
   "earth2studio>=0.12.1",

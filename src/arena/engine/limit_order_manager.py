@@ -191,6 +191,36 @@ class LimitOrderManager:
 
         return updates
 
+    async def reprice_stale_orders(self) -> list[tuple[str, str]]:
+        """
+        Reprice any stale maker orders using the latest public orderbook.
+
+        Returns `(old_order_id, new_order_id)` tuples for successful
+        replacements so the scheduler can log a concise summary.
+        """
+        if self.db is None:
+            return []
+        open_orders = [order for order in self._load_open_orders() if order.status == OrderStatus.STALE]
+        if not open_orders:
+            return []
+        current_orderbooks = await self._fetch_current_orderbooks(open_orders)
+        replacements: list[tuple[str, str]] = []
+        for placed_order in open_orders:
+            orderbook = self._resolve_orderbook(placed_order, current_orderbooks)
+            if orderbook is None:
+                continue
+            new_price = self.compute_limit_price(
+                placed_order.order.side,
+                orderbook,
+                self.config,
+                model_probability=placed_order.order.model_probability,
+            )
+            if new_price is None or abs(new_price - placed_order.order.price) < 1e-9:
+                continue
+            replacement = await self.reprice_order(placed_order.order_id, new_price)
+            replacements.append((placed_order.order_id, replacement.order_id))
+        return replacements
+
     async def reprice_order(self, order_id: str, new_price: float) -> PlacedOrder:
         """
         Cancel and replace an order to keep it near the top of the maker book.

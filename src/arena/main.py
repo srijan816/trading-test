@@ -1,7 +1,17 @@
 from __future__ import annotations
 
+# Load .env before importing modules that may read environment variables.
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - fallback for lean runtime environments
+    def load_dotenv(*_args, **_kwargs):
+        return False
+
+load_dotenv()
+
 import argparse
 import asyncio
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 import logging
 import os
@@ -11,17 +21,21 @@ import sys
 from typing import Any
 
 from arena.categorization import categorize_market
+from arena.calibration.confidence_gate import ConfidenceGate
 from arena.config import ROOT, AppConfig, load_app_config
 from arena.db import ArenaDB
+from arena.engine.limit_order_manager import LimitOrderManager
 from arena.engine.paper_executor import PaperExecutor
+from arena.engine.paper_limit_executor import PaperLimitExecutor
 from arena.engine.portfolio import apply_execution_to_portfolio, compute_position_unrealized
 from arena.engine.settlement import SettlementEngine
 from arena.exchanges.kalshi_adapter import KalshiAdapter as KalshiExchangeAdapter
+from arena.exchanges.polymarket_limit import PolymarketPublicReader
 from arena.export.cli_reports import render_table
 from arena.export.sheets_sync import build_dashboard_payloads
 from arena.env import load_local_env
 from arena.filters.spread_filter import SpreadFilter
-from arena.models import DailySnapshot, Decision, Market, utc_now
+from arena.models import DailySnapshot, Decision, ExecutionResult, Market, ProposedAction, utc_now
 from arena.risk.kelly import compute_position_size
 from arena.risk.risk_manager import RiskManager
 from arena.strategies.algo_forecast import ForecastConsensusStrategy
@@ -41,12 +55,58 @@ DISABLED_STRATEGIES = {
 }
 
 
+@dataclass(slots=True)
+class ExecutionServices:
+    adapters: dict[str, object]
+    paper_executor: PaperExecutor
+    paper_limit_executor: PaperLimitExecutor
+    limit_order_manager: LimitOrderManager
+    confidence_gate: ConfidenceGate
+    public_reader: PolymarketPublicReader
+
+    async def close(self) -> None:
+        await self.public_reader.close()
+
+
 def get_reentry_price_delta_threshold() -> float:
     return float(os.getenv("RISK_REENTRY_PRICE_DELTA_CENTS", "5")) / 100.0
 
 
 def get_db(app_config: AppConfig) -> ArenaDB:
     return ArenaDB(app_config.db_path)
+
+
+def _limit_order_config(app_config: AppConfig) -> dict[str, Any]:
+    limit_cfg = dict(app_config.execution.get("limit_orders", {}))
+    limit_cfg.setdefault("db_path", str(app_config.db_path))
+    limit_cfg.setdefault("default_starting_balance", float(app_config.arena.get("default_starting_balance", 1000.0)))
+    return limit_cfg
+
+
+def build_execution_services(app_config: AppConfig, db: ArenaDB) -> ExecutionServices:
+    adapters = build_market_adapters(app_config)
+    public_reader = PolymarketPublicReader(base_url=app_config.venues["polymarket"]["clob_base_url"])
+    limit_cfg = _limit_order_config(app_config)
+    paper_limit_executor = PaperLimitExecutor(
+        config=limit_cfg,
+        market_data_adapter=public_reader,
+    )
+    limit_order_manager = LimitOrderManager(
+        db_path=str(app_config.db_path),
+        venue_adapter=paper_limit_executor,
+        config=limit_cfg,
+    )
+    return ExecutionServices(
+        adapters=adapters,
+        paper_executor=PaperExecutor(db, extra_slippage_bps=int(app_config.arena["extra_slippage_bps"])),
+        paper_limit_executor=paper_limit_executor,
+        limit_order_manager=limit_order_manager,
+        confidence_gate=ConfidenceGate(
+            db_path=str(app_config.db_path),
+            crps_history_path=str(ROOT / "data" / "crps_history.jsonl"),
+        ),
+        public_reader=public_reader,
+    )
 
 
 def build_market_adapters(app_config: AppConfig) -> dict[str, object]:
@@ -197,7 +257,12 @@ def recategorize_markets(db: ArenaDB) -> None:
     print(f"Recategorized {updated} markets.")
 
 
-async def run_strategy_once(app_config: AppConfig, db: ArenaDB, strategy_id: str) -> Decision:
+async def run_strategy_once(
+    app_config: AppConfig,
+    db: ArenaDB,
+    strategy_id: str,
+    execution_services: ExecutionServices | None = None,
+) -> Decision:
     strategy_cfg = app_config.strategies[strategy_id].strategy
     if not bool(strategy_cfg.get("enabled", True)):
         raise RuntimeError(f"Strategy {strategy_id} is disabled in config")
@@ -237,7 +302,7 @@ async def run_strategy_once(app_config: AppConfig, db: ArenaDB, strategy_id: str
                 marked,
                 decision.decision_id,
             )
-    await execute_decision(app_config, db, strategy_cfg, decision)
+    await execute_decision(app_config, db, strategy_cfg, decision, execution_services=execution_services)
     packet_builder = getattr(strategy, "packet_builder", None)
     if packet_builder and hasattr(packet_builder, "get_research_stats"):
         stats = packet_builder.get_research_stats()
@@ -251,384 +316,403 @@ async def run_strategy_once(app_config: AppConfig, db: ArenaDB, strategy_id: str
     return decision
 
 
-async def execute_decision(app_config: AppConfig, db: ArenaDB, strategy_cfg: dict, decision: Decision) -> None:
+async def execute_decision(
+    app_config: AppConfig,
+    db: ArenaDB,
+    strategy_cfg: dict,
+    decision: Decision,
+    execution_services: ExecutionServices | None = None,
+) -> None:
     if not decision.actions:
         return
-    adapters = build_market_adapters(app_config)
-    kalshi_exchange = KalshiExchangeAdapter()
-    portfolio = db.get_portfolio(decision.strategy_id)
-    if not portfolio:
-        return
-    executor = PaperExecutor(db, extra_slippage_bps=int(app_config.arena["extra_slippage_bps"]))
-    risk_cfg = strategy_cfg.get("risk_management", strategy_cfg.get("risk", {}))
-    risk_manager = RiskManager(db, risk_cfg)
-    contract_parser = ForecastConsensusStrategy(
-        db=db,
-        strategy_config={"id": "execution_helper", "starting_balance": 1000.0, "scope": {}, "risk": strategy_cfg.get("risk", {})},
-    )
-    for action in decision.actions:
-        market_row = db.get_market(action.market_id, action.venue)
-
-        # Gate 1: market_active
-        market_active = market_row is not None and market_row["status"] == "active"
-        db.record_event(
-            "execution_gate_market_active",
-            {
-                "decision_id": decision.decision_id,
-                "strategy_id": decision.strategy_id,
-                "market_id": action.market_id,
-                "outcome_id": action.outcome_id,
-                "venue": action.venue,
-                "pass": market_active,
-                "market_status": market_row["status"] if market_row else None,
-            },
-            strategy_id=decision.strategy_id,
+    owns_services = execution_services is None
+    services = execution_services or build_execution_services(app_config, db)
+    try:
+        adapters = services.adapters
+        kalshi_exchange = KalshiExchangeAdapter()
+        portfolio = db.get_portfolio(decision.strategy_id)
+        if not portfolio:
+            return
+        risk_cfg = strategy_cfg.get("risk_management", strategy_cfg.get("risk", {}))
+        risk_manager = RiskManager(db, risk_cfg)
+        contract_parser = ForecastConsensusStrategy(
+            db=db,
+            strategy_config={"id": "execution_helper", "starting_balance": 1000.0, "scope": {}, "risk": strategy_cfg.get("risk", {})},
         )
-        if not market_active:
+        for action in decision.actions:
+            market_row = db.get_market(action.market_id, action.venue)
+
+            market_active = market_row is not None and market_row["status"] == "active"
             db.record_event(
-                "execution_skip",
+                "execution_gate_market_active",
                 {
                     "decision_id": decision.decision_id,
                     "strategy_id": decision.strategy_id,
                     "market_id": action.market_id,
                     "outcome_id": action.outcome_id,
                     "venue": action.venue,
-                    "error": "market_not_active",
-                    "gate": "market_active",
+                    "pass": market_active,
+                    "market_status": market_row["status"] if market_row else None,
                 },
                 strategy_id=decision.strategy_id,
             )
-            continue
-
-        # Gate 2: risk_approval
-        risk_result = await risk_manager.check_trade(
-            strategy_id=decision.strategy_id,
-            market_id=action.market_id,
-            amount_usd=action.amount_usd,
-            side=action.action_type,
-            venue=action.venue,
-        )
-        risk_approved = risk_result.get("approved", False)
-        db.record_event(
-            "execution_gate_risk_approval",
-            {
-                "decision_id": decision.decision_id,
-                "strategy_id": decision.strategy_id,
-                "market_id": action.market_id,
-                "outcome_id": action.outcome_id,
-                "venue": action.venue,
-                "pass": risk_approved,
-                "reason": risk_result.get("reason"),
-            },
-            strategy_id=decision.strategy_id,
-        )
-        if not risk_approved:
-            logger.info(
-                "Skipping execution for %s/%s on %s due to risk check: %s",
-                action.market_id,
-                action.outcome_id,
-                action.venue,
-                risk_result.get("reason"),
-            )
-            db.record_event(
-                "execution_skip",
-                {
-                    "decision_id": decision.decision_id,
-                    "strategy_id": decision.strategy_id,
-                    "market_id": action.market_id,
-                    "outcome_id": action.outcome_id,
-                    "venue": action.venue,
-                    "error": f"risk_check: {risk_result.get('reason')}",
-                    "risk_result": risk_result,
-                },
-                strategy_id=decision.strategy_id,
-            )
-            continue
-        if kalshi_exchange.enabled and market_row and market_row["category"] == "weather":
-            try:
-                contract = contract_parser._parse_weather_contract(market_row["question"])
-                if contract and contract.get("dated", True):
-                    outcomes = json.loads(market_row["outcomes_json"])
-                    yes_outcome, no_outcome = contract_parser._binary_outcomes(outcomes)
-                    if yes_outcome and no_outcome:
-                        comparison = kalshi_exchange.compare_market_prices(
-                            city=contract["city"],
-                            target_date=contract["forecast_date"].isoformat(),
-                            polymarket_question=market_row["question"],
-                            polymarket_yes_ask=contract_parser._buy_price(yes_outcome),
-                            polymarket_no_ask=contract_parser._buy_price(no_outcome),
-                        )
-                        if comparison:
-                            db.record_event(
-                                "cross_platform_price_comparison",
-                                {
-                                    "decision_id": decision.decision_id,
-                                    "strategy_id": decision.strategy_id,
-                                    "market_id": action.market_id,
-                                    "venue": action.venue,
-                                    "comparison": comparison,
-                                },
-                                strategy_id=decision.strategy_id,
-                            )
-                            preferred_platform = (
-                                comparison["preferred_yes_platform"]
-                                if action.outcome_label.lower() == "yes"
-                                else comparison["preferred_no_platform"]
-                            )
-                            if preferred_platform == "kalshi" and not kalshi_exchange.trade_enabled:
-                                logger.info(
-                                    "Kalshi offers better %s odds for %s, but KALSHI_TRADE_ENABLED is false. Logging only.",
-                                    action.outcome_label,
-                                    market_row["question"],
-                                )
-            except Exception as exc:
-                logger.warning("Kalshi price comparison skipped for %s: %s", action.market_id, exc)
-        adapter = adapters[action.venue]
-        orderbook = None
-        orderbook_error = None
-        try:
-            orderbook = await adapter.get_orderbook(action.market_id, action.outcome_id)
-        except Exception as exc:
-            orderbook_error = str(exc)
-            status_code = getattr(getattr(exc, "response", None), "status_code", None)
-            if status_code == 404:
+            if not market_active:
                 db.record_event(
-                    "orderbook_stale",
+                    "execution_skip",
                     {
                         "decision_id": decision.decision_id,
                         "strategy_id": decision.strategy_id,
                         "market_id": action.market_id,
                         "outcome_id": action.outcome_id,
                         "venue": action.venue,
-                        "status_code": 404,
+                        "error": "market_not_active",
+                        "gate": "market_active",
                     },
                     strategy_id=decision.strategy_id,
                 )
+                continue
 
-        # Gate 3: orderbook
-        has_orderbook = orderbook is not None
-        best_bid = None
-        best_ask = None
-        if orderbook:
-            best_bid = max((float(price) for price, _ in orderbook.bids), default=None)
-            best_ask = min((float(price) for price, _ in orderbook.asks), default=None)
-        db.record_event(
-            "execution_gate_orderbook",
-            {
-                "decision_id": decision.decision_id,
-                "strategy_id": decision.strategy_id,
-                "market_id": action.market_id,
-                "outcome_id": action.outcome_id,
-                "venue": action.venue,
-                "pass": has_orderbook,
-                "best_bid": best_bid,
-                "best_ask": best_ask,
-                "spread": round(best_ask - best_bid, 4) if best_bid is not None and best_ask is not None else None,
-                "error": orderbook_error,
-            },
-            strategy_id=decision.strategy_id,
-        )
-        if orderbook_error or not has_orderbook:
-            logger.warning("Skipping execution for %s/%s on %s: %s", action.market_id, action.outcome_id, action.venue, orderbook_error or "no orderbook")
+            if market_row and market_row["category"] == "weather":
+                contract = contract_parser._parse_weather_contract(market_row["question"])
+                city = contract.get("city") if contract else None
+                if city:
+                    tradeable, reason = services.confidence_gate.is_tradeable(city)
+                    db.record_event(
+                        "execution_gate_confidence",
+                        {
+                            "decision_id": decision.decision_id,
+                            "strategy_id": decision.strategy_id,
+                            "market_id": action.market_id,
+                            "outcome_id": action.outcome_id,
+                            "venue": action.venue,
+                            "city": city,
+                            "pass": tradeable,
+                            "reason": reason,
+                        },
+                        strategy_id=decision.strategy_id,
+                    )
+                    if not tradeable:
+                        db.record_event(
+                            "execution_skip",
+                            {
+                                "decision_id": decision.decision_id,
+                                "strategy_id": decision.strategy_id,
+                                "market_id": action.market_id,
+                                "outcome_id": action.outcome_id,
+                                "venue": action.venue,
+                                "error": f"confidence_gate: {reason}",
+                                "city": city,
+                            },
+                            strategy_id=decision.strategy_id,
+                        )
+                        continue
+
+            risk_result = await risk_manager.check_trade(
+                strategy_id=decision.strategy_id,
+                market_id=action.market_id,
+                amount_usd=action.amount_usd,
+                side=action.action_type,
+                venue=action.venue,
+            )
+            risk_approved = risk_result.get("approved", False)
             db.record_event(
-                "execution_skip",
+                "execution_gate_risk_approval",
                 {
                     "decision_id": decision.decision_id,
                     "strategy_id": decision.strategy_id,
                     "market_id": action.market_id,
                     "outcome_id": action.outcome_id,
                     "venue": action.venue,
-                    "error": orderbook_error or "no orderbook",
+                    "pass": risk_approved,
+                    "reason": risk_result.get("reason"),
                 },
                 strategy_id=decision.strategy_id,
             )
-            continue
+            if not risk_approved:
+                db.record_event(
+                    "execution_skip",
+                    {
+                        "decision_id": decision.decision_id,
+                        "strategy_id": decision.strategy_id,
+                        "market_id": action.market_id,
+                        "outcome_id": action.outcome_id,
+                        "venue": action.venue,
+                        "error": f"risk_check: {risk_result.get('reason')}",
+                        "risk_result": risk_result,
+                    },
+                    strategy_id=decision.strategy_id,
+                )
+                continue
 
-        db.save_orderbook_snapshot(orderbook)
-        with db.connect() as conn:
-            existing_row = conn.execute(
-                "SELECT COUNT(*) AS cnt, "
-                "COALESCE(SUM(quantity * avg_entry_price), 0) / NULLIF(SUM(quantity), 0) AS avg_entry_price "
-                "FROM positions WHERE market_id = ? AND venue = ? AND status = 'open'",
-                (action.market_id, action.venue),
-            ).fetchone()
-        existing_count = int(existing_row["cnt"] or 0) if existing_row else 0
-        avg_entry_price = float(existing_row["avg_entry_price"]) if existing_row and existing_row["avg_entry_price"] is not None else None
-        current_market_price = float(orderbook.mid)
-        reentry_threshold = get_reentry_price_delta_threshold()
-        price_delta = abs(current_market_price - avg_entry_price) if avg_entry_price is not None else None
-        # Gate 4: reentry check
-        reentry_allowed = not (existing_count > 0 and avg_entry_price is not None and price_delta <= reentry_threshold)
-        db.record_event(
-            "execution_gate_reentry",
-            {
-                "decision_id": decision.decision_id,
-                "strategy_id": decision.strategy_id,
-                "market_id": action.market_id,
-                "venue": action.venue,
-                "outcome_id": action.outcome_id,
-                "pass": reentry_allowed,
-                "existing_positions": existing_count,
-                "avg_entry_price": round(avg_entry_price, 4) if avg_entry_price is not None else None,
-                "current_market_price": round(current_market_price, 4),
-                "price_delta": round(price_delta, 4) if existing_count > 0 and avg_entry_price is not None else None,
-                "reentry_threshold": round(reentry_threshold, 4),
-            },
-            strategy_id=decision.strategy_id,
-        )
-        if not reentry_allowed:
-            logger.info(
-                "Re-entry blocked on market %s: existing %s positions, avg entry %.3f, current price %.3f, delta %.3f < threshold %.3f",
-                action.market_id,
-                existing_count,
-                avg_entry_price,
-                current_market_price,
-                price_delta,
-                reentry_threshold,
-            )
-            db.record_event(
-                "reentry_blocked",
-                {
-                    "decision_id": decision.decision_id,
-                    "strategy_id": decision.strategy_id,
-                    "market_id": action.market_id,
-                    "venue": action.venue,
-                    "existing_positions": existing_count,
-                    "avg_entry_price": round(avg_entry_price, 4),
-                    "current_market_price": round(current_market_price, 4),
-                    "delta": round(price_delta, 4),
-                    "threshold": round(reentry_threshold, 4),
-                },
-                strategy_id=decision.strategy_id,
-            )
-            continue
-        outcome_side = "yes" if action.outcome_label.lower() == "yes" else "no"
-        selected_probability = (
-            float(decision.predicted_probability)
-            if outcome_side == "yes"
-            else 1.0 - float(decision.predicted_probability)
-        ) if decision.predicted_probability is not None else None
-        volume_proxy = None
-        if market_row is not None:
-            raw_volume = market_row["volume_usd"]
-            if raw_volume is not None:
+            if kalshi_exchange.enabled and market_row and market_row["category"] == "weather":
                 try:
-                    volume_proxy = int(round(float(raw_volume)))
-                except (TypeError, ValueError):
-                    volume_proxy = None
-        spread_result = (
-            SpreadFilter.check(
-                our_probability=selected_probability,
-                best_bid=best_bid,
-                best_ask=best_ask,
-                volume=volume_proxy,
-                side=outcome_side,
-            )
-            if selected_probability is not None and best_bid is not None and best_ask is not None
-            else {
-                "pass": False,
-                "reason": "missing probability or bid/ask for spread filter",
-                "best_bid": best_bid,
-                "best_ask": best_ask,
-                "our_probability": selected_probability,
-                "side": outcome_side,
-                "volume": volume_proxy,
-            }
-        )
-        # Gate 5: spread_filter
-        spread_value = round(best_ask - best_bid, 4) if best_bid is not None and best_ask is not None else None
-        db.record_event(
-            "execution_gate_spread_filter",
-            {
-                "decision_id": decision.decision_id,
-                "strategy_id": decision.strategy_id,
-                "market_id": action.market_id,
-                "outcome_id": action.outcome_id,
-                "venue": action.venue,
-                "pass": spread_result["pass"],
-                "spread_value": spread_value,
-                "spread_threshold_cents": 8,
-                "reason": spread_result.get("reason"),
-                "best_bid": best_bid,
-                "best_ask": best_ask,
-                "volume": volume_proxy,
-                "side": outcome_side,
-            },
-            strategy_id=decision.strategy_id,
-        )
-        if not spread_result["pass"]:
-            logger.info(
-                "Skipping execution for %s/%s on %s due to spread filter: %s",
-                action.market_id,
-                action.outcome_id,
-                action.venue,
-                spread_result["reason"],
-            )
+                    contract = contract_parser._parse_weather_contract(market_row["question"])
+                    if contract and contract.get("dated", True):
+                        outcomes = json.loads(market_row["outcomes_json"])
+                        yes_outcome, no_outcome = contract_parser._binary_outcomes(outcomes)
+                        if yes_outcome and no_outcome:
+                            comparison = kalshi_exchange.compare_market_prices(
+                                city=contract["city"],
+                                target_date=contract["forecast_date"].isoformat(),
+                                polymarket_question=market_row["question"],
+                                polymarket_yes_ask=contract_parser._buy_price(yes_outcome),
+                                polymarket_no_ask=contract_parser._buy_price(no_outcome),
+                            )
+                            if comparison:
+                                db.record_event(
+                                    "cross_platform_price_comparison",
+                                    {
+                                        "decision_id": decision.decision_id,
+                                        "strategy_id": decision.strategy_id,
+                                        "market_id": action.market_id,
+                                        "venue": action.venue,
+                                        "comparison": comparison,
+                                    },
+                                    strategy_id=decision.strategy_id,
+                                )
+                except Exception as exc:
+                    logger.warning("Kalshi price comparison skipped for %s: %s", action.market_id, exc)
+
+            adapter = adapters[action.venue]
+            orderbook = None
+            orderbook_error = None
+            try:
+                orderbook = await adapter.get_orderbook(action.market_id, action.outcome_id)
+            except Exception as exc:
+                orderbook_error = str(exc)
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                if status_code == 404:
+                    db.record_event(
+                        "orderbook_stale",
+                        {
+                            "decision_id": decision.decision_id,
+                            "strategy_id": decision.strategy_id,
+                            "market_id": action.market_id,
+                            "outcome_id": action.outcome_id,
+                            "venue": action.venue,
+                            "status_code": 404,
+                        },
+                        strategy_id=decision.strategy_id,
+                    )
+
+            has_orderbook = orderbook is not None
+            best_bid = None
+            best_ask = None
+            if orderbook:
+                best_bid = max((float(price) for price, _ in orderbook.bids), default=None)
+                best_ask = min((float(price) for price, _ in orderbook.asks), default=None)
             db.record_event(
-                "execution_skip",
+                "execution_gate_orderbook",
                 {
                     "decision_id": decision.decision_id,
                     "strategy_id": decision.strategy_id,
                     "market_id": action.market_id,
                     "outcome_id": action.outcome_id,
-                    "outcome_label": action.outcome_label,
                     "venue": action.venue,
-                    "spread_filter": spread_result,
-                    "error": f"spread_filter: {spread_result['reason']}",
+                    "pass": has_orderbook,
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "spread": round(best_ask - best_bid, 4) if best_bid is not None and best_ask is not None else None,
+                    "error": orderbook_error,
                 },
                 strategy_id=decision.strategy_id,
             )
-            continue
-        fee_bps = infer_fee_bps(app_config, db.get_market(action.market_id, action.venue))
+            if orderbook_error or not has_orderbook:
+                db.record_event(
+                    "execution_skip",
+                    {
+                        "decision_id": decision.decision_id,
+                        "strategy_id": decision.strategy_id,
+                        "market_id": action.market_id,
+                        "outcome_id": action.outcome_id,
+                        "venue": action.venue,
+                        "error": orderbook_error or "no orderbook",
+                    },
+                    strategy_id=decision.strategy_id,
+                )
+                continue
 
-        # ── FIX 2: Central Kelly sizing enforcement ──────────────────────
-        # Every strategy passes through here. Recompute Kelly from scratch
-        # in DOLLAR terms and cap to RISK_MAX_SINGLE_TRADE_SIZE.
-        original_amount_usd = action.amount_usd
-        market_price = min((float(p) for p, _ in orderbook.asks), default=None) if orderbook.asks else None
-        market_price = market_price if market_price is not None else current_market_price
-        sizing_cfg = app_config.position_sizing
-        kelly_result = compute_position_size(
-            predicted_probability=selected_probability if selected_probability is not None else market_price,
-            market_ask_price=market_price,
-            bankroll=portfolio.cash,
-            kelly_fraction=sizing_cfg.get("kelly_fraction"),
-            max_position_pct=float(sizing_cfg.get("max_position_pct", 0.02)),
-            max_position_usd=float(sizing_cfg.get("max_position_usd", 25.0)),
-            fee_rate=fee_bps / 10000.0,
-            yes_side_probability=float(decision.predicted_probability) if decision.predicted_probability is not None else None,
-        )
-        kelly_action = kelly_result.get("action", "no_trade")
-        kelly_computed_size = kelly_result.get("amount_usd", 0)
-        # Gate 6: kelly_sizing
-        db.record_event(
-            "execution_gate_kelly_sizing",
-            {
-                "decision_id": decision.decision_id,
-                "strategy_id": decision.strategy_id,
-                "market_id": action.market_id,
-                "outcome_id": action.outcome_id,
-                "venue": action.venue,
-                "pass": kelly_action == "trade",
-                "kelly_action": kelly_action,
-                "computed_size": round(kelly_computed_size, 2),
-                "min_threshold": float(os.getenv("RISK_MIN_TRADE_SIZE", "5")),
-                "hard_cap": float(os.getenv("RISK_MAX_SINGLE_TRADE_SIZE", "50")),
-                "reason": kelly_result.get("reason"),
-                "selected_probability": selected_probability,
-                "market_ask_price": market_price,
-                "kelly_full": kelly_result.get("kelly_full"),
-                "half_kelly_amount_usd": kelly_result.get("half_kelly_amount_usd"),
-                "capped_amount_usd": kelly_result.get("capped_amount_usd"),
-                "low_confidence_reduction": kelly_result.get("low_confidence_reduction_applied"),
-            },
-            strategy_id=decision.strategy_id,
-        )
-        if kelly_result["action"] == "no_trade":
-            logger.info(
-                "Kelly enforcement says no trade for %s/%s: %s",
-                action.market_id, action.outcome_id, kelly_result.get("reason"),
+            db.save_orderbook_snapshot(orderbook)
+            with db.connect() as conn:
+                existing_row = conn.execute(
+                    "SELECT COUNT(*) AS cnt, "
+                    "COALESCE(SUM(quantity * avg_entry_price), 0) / NULLIF(SUM(quantity), 0) AS avg_entry_price "
+                    "FROM positions WHERE market_id = ? AND venue = ? AND status = 'open'",
+                    (action.market_id, action.venue),
+                ).fetchone()
+            existing_count = int(existing_row["cnt"] or 0) if existing_row else 0
+            avg_entry_price = float(existing_row["avg_entry_price"]) if existing_row and existing_row["avg_entry_price"] is not None else None
+            current_market_price = float(orderbook.mid)
+            reentry_threshold = get_reentry_price_delta_threshold()
+            price_delta = abs(current_market_price - avg_entry_price) if avg_entry_price is not None else None
+            reentry_allowed = not (existing_count > 0 and avg_entry_price is not None and price_delta <= reentry_threshold)
+            db.record_event(
+                "execution_gate_reentry",
+                {
+                    "decision_id": decision.decision_id,
+                    "strategy_id": decision.strategy_id,
+                    "market_id": action.market_id,
+                    "venue": action.venue,
+                    "outcome_id": action.outcome_id,
+                    "pass": reentry_allowed,
+                    "existing_positions": existing_count,
+                    "avg_entry_price": round(avg_entry_price, 4) if avg_entry_price is not None else None,
+                    "current_market_price": round(current_market_price, 4),
+                    "price_delta": round(price_delta, 4) if existing_count > 0 and avg_entry_price is not None else None,
+                    "reentry_threshold": round(reentry_threshold, 4),
+                },
+                strategy_id=decision.strategy_id,
             )
+            if not reentry_allowed:
+                db.record_event(
+                    "reentry_blocked",
+                    {
+                        "decision_id": decision.decision_id,
+                        "strategy_id": decision.strategy_id,
+                        "market_id": action.market_id,
+                        "venue": action.venue,
+                        "existing_positions": existing_count,
+                        "avg_entry_price": round(avg_entry_price, 4),
+                        "current_market_price": round(current_market_price, 4),
+                        "delta": round(price_delta, 4),
+                        "threshold": round(reentry_threshold, 4),
+                    },
+                    strategy_id=decision.strategy_id,
+                )
+                continue
+
+            outcome_side = "yes" if action.outcome_label.lower() == "yes" else "no"
+            selected_probability = (
+                float(decision.predicted_probability)
+                if outcome_side == "yes"
+                else 1.0 - float(decision.predicted_probability)
+            ) if decision.predicted_probability is not None else None
+            volume_proxy = None
+            if market_row is not None:
+                raw_volume = market_row["volume_usd"]
+                if raw_volume is not None:
+                    try:
+                        volume_proxy = int(round(float(raw_volume)))
+                    except (TypeError, ValueError):
+                        volume_proxy = None
+            spread_result = (
+                SpreadFilter.check(
+                    our_probability=selected_probability,
+                    best_bid=best_bid,
+                    best_ask=best_ask,
+                    volume=volume_proxy,
+                    side=outcome_side,
+                )
+                if selected_probability is not None and best_bid is not None and best_ask is not None
+                else {
+                    "pass": False,
+                    "reason": "missing probability or bid/ask for spread filter",
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "our_probability": selected_probability,
+                    "side": outcome_side,
+                    "volume": volume_proxy,
+                }
+            )
+            spread_value = round(best_ask - best_bid, 4) if best_bid is not None and best_ask is not None else None
+            db.record_event(
+                "execution_gate_spread_filter",
+                {
+                    "decision_id": decision.decision_id,
+                    "strategy_id": decision.strategy_id,
+                    "market_id": action.market_id,
+                    "outcome_id": action.outcome_id,
+                    "venue": action.venue,
+                    "pass": spread_result["pass"],
+                    "spread_value": spread_value,
+                    "spread_threshold_cents": 8,
+                    "reason": spread_result.get("reason"),
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "volume": volume_proxy,
+                    "side": outcome_side,
+                },
+                strategy_id=decision.strategy_id,
+            )
+            if not spread_result["pass"]:
+                db.record_event(
+                    "execution_skip",
+                    {
+                        "decision_id": decision.decision_id,
+                        "strategy_id": decision.strategy_id,
+                        "market_id": action.market_id,
+                        "outcome_id": action.outcome_id,
+                        "outcome_label": action.outcome_label,
+                        "venue": action.venue,
+                        "spread_filter": spread_result,
+                        "error": f"spread_filter: {spread_result['reason']}",
+                    },
+                    strategy_id=decision.strategy_id,
+                )
+                continue
+
+            fee_bps = infer_fee_bps(app_config, db.get_market(action.market_id, action.venue))
+            original_amount_usd = action.amount_usd
+            market_price = min((float(p) for p, _ in orderbook.asks), default=None) if orderbook.asks else None
+            market_price = market_price if market_price is not None else current_market_price
+            sizing_cfg = app_config.position_sizing
+            kelly_result = compute_position_size(
+                predicted_probability=selected_probability if selected_probability is not None else market_price,
+                market_ask_price=market_price,
+                bankroll=portfolio.cash,
+                kelly_fraction=sizing_cfg.get("kelly_fraction"),
+                max_position_pct=float(sizing_cfg.get("max_position_pct", 0.02)),
+                max_position_usd=float(sizing_cfg.get("max_position_usd", 25.0)),
+                fee_rate=fee_bps / 10000.0,
+                yes_side_probability=float(decision.predicted_probability) if decision.predicted_probability is not None else None,
+            )
+            kelly_action = kelly_result.get("action", "no_trade")
+            kelly_computed_size = kelly_result.get("amount_usd", 0)
+            db.record_event(
+                "execution_gate_kelly_sizing",
+                {
+                    "decision_id": decision.decision_id,
+                    "strategy_id": decision.strategy_id,
+                    "market_id": action.market_id,
+                    "outcome_id": action.outcome_id,
+                    "venue": action.venue,
+                    "pass": kelly_action == "trade",
+                    "kelly_action": kelly_action,
+                    "computed_size": round(kelly_computed_size, 2),
+                    "min_threshold": float(os.getenv("RISK_MIN_TRADE_SIZE", "5")),
+                    "hard_cap": float(os.getenv("RISK_MAX_SINGLE_TRADE_SIZE", "50")),
+                    "reason": kelly_result.get("reason"),
+                    "selected_probability": selected_probability,
+                    "market_ask_price": market_price,
+                    "kelly_full": kelly_result.get("kelly_full"),
+                    "half_kelly_amount_usd": kelly_result.get("half_kelly_amount_usd"),
+                    "capped_amount_usd": kelly_result.get("capped_amount_usd"),
+                    "low_confidence_reduction": kelly_result.get("low_confidence_reduction_applied"),
+                },
+                strategy_id=decision.strategy_id,
+            )
+            if kelly_result["action"] == "no_trade":
+                db.record_event(
+                    "trade_sizing",
+                    {
+                        "decision_id": decision.decision_id,
+                        "strategy_id": decision.strategy_id,
+                        "market_id": action.market_id,
+                        "venue": action.venue,
+                        "outcome_id": action.outcome_id,
+                        "original_amount_usd": round(original_amount_usd, 2),
+                        "kelly_result": kelly_result,
+                        "final_amount_usd": 0,
+                        "action": "blocked",
+                    },
+                    strategy_id=decision.strategy_id,
+                )
+                continue
+
+            kelly_amount = kelly_result["amount_usd"]
+            hard_cap = float(os.getenv("RISK_MAX_SINGLE_TRADE_SIZE", "50"))
+            enforced_amount = min(kelly_amount, hard_cap, original_amount_usd)
+            action.amount_usd = enforced_amount
             db.record_event(
                 "trade_sizing",
                 {
@@ -638,76 +722,110 @@ async def execute_decision(app_config: AppConfig, db: ArenaDB, strategy_cfg: dic
                     "venue": action.venue,
                     "outcome_id": action.outcome_id,
                     "original_amount_usd": round(original_amount_usd, 2),
-                    "kelly_result": kelly_result,
-                    "final_amount_usd": 0,
-                    "action": "blocked",
+                    "kelly_full": kelly_result.get("kelly_full"),
+                    "raw_amount_usd": kelly_result.get("raw_amount_usd"),
+                    "half_kelly_amount_usd": kelly_result.get("half_kelly_amount_usd"),
+                    "capped_amount_usd": kelly_result.get("capped_amount_usd"),
+                    "low_confidence_reduction": kelly_result.get("low_confidence_reduction_applied"),
+                    "kelly_final_usd": kelly_amount,
+                    "hard_cap_usd": hard_cap,
+                    "enforced_amount_usd": round(enforced_amount, 2),
+                    "action": "sized",
                 },
                 strategy_id=decision.strategy_id,
             )
-            continue
-        kelly_amount = kelly_result["amount_usd"]
-        # Hard dollar cap: RISK_MAX_SINGLE_TRADE_SIZE (default 50)
-        hard_cap = float(os.getenv("RISK_MAX_SINGLE_TRADE_SIZE", "50"))
-        enforced_amount = min(kelly_amount, hard_cap, original_amount_usd)
-        action.amount_usd = enforced_amount
-        db.record_event(
-            "trade_sizing",
-            {
-                "decision_id": decision.decision_id,
-                "strategy_id": decision.strategy_id,
-                "market_id": action.market_id,
-                "venue": action.venue,
-                "outcome_id": action.outcome_id,
-                "original_amount_usd": round(original_amount_usd, 2),
-                "kelly_full": kelly_result.get("kelly_full"),
-                "raw_amount_usd": kelly_result.get("raw_amount_usd"),
-                "half_kelly_amount_usd": kelly_result.get("half_kelly_amount_usd"),
-                "capped_amount_usd": kelly_result.get("capped_amount_usd"),
-                "low_confidence_reduction": kelly_result.get("low_confidence_reduction_applied"),
-                "kelly_final_usd": kelly_amount,
-                "hard_cap_usd": hard_cap,
-                "enforced_amount_usd": round(enforced_amount, 2),
-                "action": "sized",
-            },
-            strategy_id=decision.strategy_id,
-        )
-        logger.info(
-            "Kelly enforcement: %s/%s original=$%.2f kelly=$%.2f cap=$%.2f → final=$%.2f",
-            action.market_id, action.outcome_id,
-            original_amount_usd, kelly_amount, hard_cap, enforced_amount,
-        )
-        # ── END FIX 2 ───────────────────────────────────────────────────
 
-        try:
-            execution, position = executor.execute(
-                decision_id=decision.decision_id,
-                strategy_id=decision.strategy_id,
-                action=action,
-                orderbook=orderbook,
-                portfolio=portfolio,
-                risk_limits=strategy_cfg["risk"],
-                fee_bps=fee_bps,
-            )
-        except Exception as exc:
-            logger.warning("Execution failed for %s/%s on %s: %s", action.market_id, action.outcome_id, action.venue, exc)
-            db.record_event(
-                "execution_error",
-                {
-                    "decision_id": decision.decision_id,
-                    "strategy_id": decision.strategy_id,
-                    "market_id": action.market_id,
-                    "outcome_id": action.outcome_id,
-                    "venue": action.venue,
-                    "error": str(exc),
-                },
-                strategy_id=decision.strategy_id,
-            )
-            continue
-        db.save_execution(execution)
-        if position:
-            db.upsert_position(position)
-            portfolio = apply_execution_to_portfolio(portfolio, position, execution)
-            db.save_portfolio(portfolio)
+            execution_mode = str(os.getenv("EXECUTION_MODE", "paper_limit") or "paper_limit").strip().lower()
+            if execution_mode == "live_limit":
+                db.record_event(
+                    "execution_mode_fallback",
+                    {
+                        "decision_id": decision.decision_id,
+                        "strategy_id": decision.strategy_id,
+                        "market_id": action.market_id,
+                        "outcome_id": action.outcome_id,
+                        "requested_mode": "live_limit",
+                        "effective_mode": "paper_limit",
+                        "reason": "live_limit_not_implemented",
+                    },
+                    strategy_id=decision.strategy_id,
+                )
+                execution_mode = "paper_limit"
+
+            if execution_mode == "paper_limit" and str(action.venue) == "polymarket":
+                placed = await _submit_paper_limit_order(
+                    app_config=app_config,
+                    db=db,
+                    decision=decision,
+                    action=action,
+                    orderbook=orderbook,
+                    selected_probability=selected_probability,
+                    limit_order_manager=services.limit_order_manager,
+                )
+                if placed is None:
+                    continue
+                db.record_event(
+                    "limit_order_submitted",
+                    {
+                        "decision_id": decision.decision_id,
+                        "strategy_id": decision.strategy_id,
+                        "market_id": action.market_id,
+                        "outcome_id": action.outcome_id,
+                        "venue": action.venue,
+                        "order_id": placed.order_id,
+                        "venue_order_id": placed.venue_order_id,
+                        "status": placed.status.value,
+                    },
+                    strategy_id=decision.strategy_id,
+                )
+                continue
+            if execution_mode == "paper_limit":
+                db.record_event(
+                    "execution_mode_fallback",
+                    {
+                        "decision_id": decision.decision_id,
+                        "strategy_id": decision.strategy_id,
+                        "market_id": action.market_id,
+                        "outcome_id": action.outcome_id,
+                        "requested_mode": "paper_limit",
+                        "effective_mode": "paper",
+                        "reason": f"unsupported_venue:{action.venue}",
+                    },
+                    strategy_id=decision.strategy_id,
+                )
+
+            try:
+                execution, position = services.paper_executor.execute(
+                    decision_id=decision.decision_id,
+                    strategy_id=decision.strategy_id,
+                    action=action,
+                    orderbook=orderbook,
+                    portfolio=portfolio,
+                    risk_limits=strategy_cfg["risk"],
+                    fee_bps=fee_bps,
+                )
+            except Exception as exc:
+                db.record_event(
+                    "execution_error",
+                    {
+                        "decision_id": decision.decision_id,
+                        "strategy_id": decision.strategy_id,
+                        "market_id": action.market_id,
+                        "outcome_id": action.outcome_id,
+                        "venue": action.venue,
+                        "error": str(exc),
+                    },
+                    strategy_id=decision.strategy_id,
+                )
+                continue
+            db.save_execution(execution)
+            if position:
+                db.upsert_position(position)
+                portfolio = apply_execution_to_portfolio(portfolio, position, execution)
+                db.save_portfolio(portfolio)
+    finally:
+        if owns_services:
+            await services.close()
 
 
 def infer_fee_bps(app_config: AppConfig, market_row) -> float:
@@ -722,6 +840,118 @@ def infer_fee_bps(app_config: AppConfig, market_row) -> float:
         "economics": "default_economics_bps",
     }
     return float(app_config.fees[mapping.get(category, "default_event_bps")])
+
+
+async def _submit_paper_limit_order(
+    app_config: AppConfig,
+    db: ArenaDB,
+    decision: Decision,
+    action: ProposedAction,
+    orderbook,
+    selected_probability: float | None,
+    limit_order_manager: LimitOrderManager,
+):
+    from arena.engine.order_types import LimitOrder, OrderSide
+
+    if selected_probability is None:
+        db.record_event(
+            "execution_skip",
+            {
+                "decision_id": decision.decision_id,
+                "strategy_id": decision.strategy_id,
+                "market_id": action.market_id,
+                "outcome_id": action.outcome_id,
+                "venue": action.venue,
+                "error": "missing selected_probability for paper_limit execution",
+            },
+            strategy_id=decision.strategy_id,
+        )
+        return None
+
+    limit_price = limit_order_manager.compute_limit_price(
+        OrderSide.BUY_YES if str(action.outcome_label).lower() == "yes" else OrderSide.BUY_NO,
+        orderbook,
+        limit_order_manager.config,
+        model_probability=selected_probability,
+    )
+    if limit_price is None:
+        db.record_event(
+            "execution_skip",
+            {
+                "decision_id": decision.decision_id,
+                "strategy_id": decision.strategy_id,
+                "market_id": action.market_id,
+                "outcome_id": action.outcome_id,
+                "venue": action.venue,
+                "error": "no_profitable_maker_price",
+            },
+            strategy_id=decision.strategy_id,
+        )
+        return None
+
+    quantity = round(float(action.amount_usd) / float(limit_price), 6)
+    order = LimitOrder(
+        market_id=str(action.market_id),
+        side=OrderSide.BUY_YES if str(action.outcome_label).lower() == "yes" else OrderSide.BUY_NO,
+        price=float(limit_price),
+        size_dollars=float(action.amount_usd),
+        quantity=quantity,
+        strategy_id=decision.strategy_id,
+        model_probability=float(selected_probability),
+        edge_bps=int(decision.expected_edge_bps or 0),
+        ttl_seconds=int(app_config.execution.get("limit_orders", {}).get("order_ttl_seconds", 300)),
+        metadata={
+            "decision_id": decision.decision_id,
+            "outcome_id": str(action.outcome_id),
+            "token_id": str(action.outcome_id),
+            "outcome_label": str(action.outcome_label),
+            "venue": str(action.venue),
+            "reasoning_summary": str(action.reasoning_summary),
+            "market_implied_probability": decision.market_implied_probability,
+        },
+    )
+    return await limit_order_manager.place_limit_order(order)
+
+
+async def monitor_limit_orders(
+    app_config: AppConfig,
+    db: ArenaDB,
+    execution_services: ExecutionServices,
+) -> None:
+    updates = await execution_services.limit_order_manager.monitor_orders()
+    replacements = await execution_services.limit_order_manager.reprice_stale_orders()
+    if updates:
+        db.record_event(
+            "limit_order_monitor_cycle",
+            {
+                "updates": [
+                    {
+                        "order_id": update.order_id,
+                        "old_status": update.old_status.value,
+                        "new_status": update.new_status.value,
+                        "fill_price": update.fill_price,
+                        "fill_quantity": update.fill_quantity,
+                        "timestamp": update.timestamp.isoformat(),
+                    }
+                    for update in updates
+                ],
+                "replacement_count": len(replacements),
+            },
+        )
+    elif replacements:
+        db.record_event(
+            "limit_order_monitor_cycle",
+            {
+                "updates": [],
+                "replacement_count": len(replacements),
+            },
+        )
+    if updates or replacements:
+        logger.info(
+            "limit order monitor: %d updates, %d reprices",
+            len(updates),
+            len(replacements),
+        )
 
 
 async def mark_to_market(app_config: AppConfig, db: ArenaDB) -> None:
@@ -1206,7 +1436,11 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "run-once":
         db.initialize()
-        decision = asyncio.run(run_strategy_once(app_config, db, args.strategy_id))
+        execution_services = build_execution_services(app_config, db)
+        try:
+            decision = asyncio.run(run_strategy_once(app_config, db, args.strategy_id, execution_services=execution_services))
+        finally:
+            asyncio.run(execution_services.close())
         print(json.dumps({"decision_id": decision.decision_id, "strategy_id": decision.strategy_id, "actions": len(decision.actions)}, indent=2))
         return
     if args.command == "show-decision":
@@ -1255,15 +1489,19 @@ def main(argv: list[str] | None = None) -> None:
 
         db.initialize()
         ensure_portfolios(app_config, db)
+        execution_services = build_execution_services(app_config, db)
         scheduler = build_scheduler(
             app_config,
             jobs={
                 "scan_markets": lambda: asyncio.run(scan_markets(app_config, db)),
                 "poll_resolutions": lambda: asyncio.run(poll_resolutions(app_config, db)),
                 "mark_to_market": lambda: asyncio.run(mark_to_market(app_config, db)),
+                "monitor_limit_orders": lambda: asyncio.run(monitor_limit_orders(app_config, db, execution_services)),
                 "export_dashboard": lambda: export_dashboard(app_config, db),
                 "check_manual_responses": lambda: None,
-                "run_strategy": lambda strategy_id: asyncio.run(run_strategy_once(app_config, db, strategy_id)),
+                "run_strategy": lambda strategy_id: asyncio.run(
+                    run_strategy_once(app_config, db, strategy_id, execution_services=execution_services)
+                ),
                 "monitor_intraday": lambda: asyncio.run(monitor_intraday_weather(app_config, db)),
                 "poll_fourcastnet": lambda: asyncio.run(poll_fourcastnet_cache(app_config, db)),
                 "capture_daily_snapshots": lambda: capture_daily_snapshots(app_config, db),
@@ -1271,7 +1509,10 @@ def main(argv: list[str] | None = None) -> None:
                 "run_monthly_meta_prompt": lambda: run_monthly_meta_prompt(db),
             },
         )
-        scheduler.start()
+        try:
+            scheduler.start()
+        finally:
+            asyncio.run(execution_services.close())
 
 
 def _json_or_raw(value: Any) -> Any:
